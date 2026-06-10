@@ -2158,3 +2158,40 @@ curl -X POST https://eab-master:9533/v1/addresses/release \
       (e.g. for BGP controller integration)
 - [ ] IPv6 support
 - [ ] Quota management per CloudPod or project
+
+## 13. External NAT Realization (AWS-style)
+
+By default, once the EAB has allocated a floating IP, it is *realized* inside OVN: Neutron
+writes a single `dnat_and_snat` entry into the OVN northbound `NAT` table, and the
+[ovn-route-agent](#3-network-side-counterpart-ovn-route-agent) announces the corresponding
+/32 route via BGP (see Section 3).
+
+An alternative, more AWS-like model **decouples allocation from realization entirely**: the
+floating IP is still allocated via Neutron/EAB, but the 1:1 NAT is applied by a layer
+**outside of OpenStack/OVN**, and **no `dnat_and_snat` entry is created in OVN at all**. The
+public IP then exists only as a control-plane record (Neutron/EAB) and as a NAT rule at the
+network edge — exactly like an AWS Elastic IP, where the instance never sees its own public
+address.
+
+| Layer | Default (Section 3) | External NAT realization |
+|---|---|---|
+| **Allocation** (who owns the IP) | Neutron IPAM → EAB | Neutron IPAM → EAB (unchanged) |
+| **Association** (FIP ↔ VM) | Neutron `floatingip` | Neutron `floatingip` (unchanged) |
+| **Realization / NAT** | OVN `dnat_and_snat` + ovn-route-agent /32 | external NAT layer, **not in OVN** |
+
+```
+   Default:   Neutron/EAB ─► OVN dnat_and_snat ─► ovn-route-agent ─► BGP /32
+   External:  Neutron/EAB ─► L3 flavor driver (no OVN NAT) ─► external NAT layer ─► BGP /32
+                                                              (stateless 1:1 FIP↔IRIP)
+```
+
+The realization is suppressed in OVN via a custom **L3 flavor / service-provider driver**
+(`external-nat`) that overrides only the floating-IP operations and exports the mapping to an
+external, stateless 1:1 NAT layer (e.g. nftables+FRR, VPP, or a DPU). OVN keeps doing plain
+internal routing of a unique *internal routable IP* (IRIP); the public FIP never appears in
+the overlay.
+
+For the full design — the L3 flavor driver, the EAB master data-model and `/v1/nat/*` API
+extensions, the IRIP pool, the external NAT layer, end-to-end packet flows, and a phased
+implementation plan — see **[EXTERNAL-NAT-REALIZATION.md](EXTERNAL-NAT-REALIZATION.md)**
+(design / draft).
