@@ -15,7 +15,7 @@ The External Address Broker (EAB) decouples floating IP **allocation** from the 
 CloudPod: a central master is the source of truth, and the Neutron IPAM driver asks the local
 agent before every FIP allocation, so the same public IP is never assigned in two CloudPods
 at once. The **realization** of the FIP still happens classically in OVN today (a
-`dnat_and_snat` NAT entry), and the `ovn-route-agent` announces the corresponding /32 route
+`dnat_and_snat` NAT entry), and the `ovn-network-agent` announces the corresponding /32 route
 via BGP.
 
 ### 1.2 What this document adds
@@ -67,7 +67,7 @@ external_ids  : {"neutron:fip_id"=..., "neutron:fip_external_mac"=..., ...}
 
 From this, `ovn-northd` derives the logical flows (`lr_in_dnat`, `lr_out_snat`, ARP
 responder), `ovn-controller` renders OpenFlow on the responsible chassis, and the
-`ovn-route-agent` reads exactly these NAT entries to announce the /32 via BGP.
+`ovn-network-agent` reads exactly these NAT entries to announce the /32 via BGP.
 
 **The row is written by** `OVNClient._create_or_update_floatingip`
 (`neutron/plugins/ml2/drivers/ovn/mech_driver/ovsdb/ovn_client.py`), invoked by the OVN L3
@@ -105,7 +105,7 @@ service plugin.
   ┌─ DC fabric / OVN — routes only the IRIP ─────────────────
   │
   │   routes ONLY the IRIP to the VM
-  │     • IRIP unique + announced via BGP (ovn-route-agent)
+  │     • IRIP unique + announced via BGP (ovn-network-agent)
   │     • OVN: pure L3 routing — NO NAT, NO public IP
   └──────────────────────────────────────────────────────────
 ```
@@ -128,7 +128,7 @@ avoids the overlap problem and fits EAB's already centrally managed address spac
 - Every VM with a FIP gets an IRIP that is **unique within the operator's routing domain**
   (no overlap on the path NAT layer ↔ OVN).
 - The IRIP is announced via BGP **internally** (not to the internet) from the VM's compute
-  node (`ovn-route-agent`/`ovn-bgp-agent`), so the NAT layer can reach any VM by its IRIP.
+  node (`ovn-network-agent`/`ovn-bgp-agent`), so the NAT layer can reach any VM by its IRIP.
 - **OVN routes only the IRIP** — plain L3 routing, no NAT, no public IP.
 
 > **Constraint:** IRIPs must be unique on the path NAT layer ↔ OVN. EAB manages an **IRIP
@@ -322,20 +322,20 @@ fabric routes inbound IRIP destinations to the VM (via internal BGP, §6.5).
 - [ ] HA: ≥2 NAT nodes, ECMP/anycast, identical rule set (stateless ⇒ no state sync).
 - [ ] Ensure the outbound default route of the IRIP sources goes through the NAT layer.
 
-### 6.5 Internal routability of the IRIP (`ovn-route-agent`)
+### 6.5 Internal routability of the IRIP (`ovn-network-agent`)
 
 So that inbound (DNAT'd) packets to the IRIP reach the VM, the IRIP is announced **internally**
 via BGP from the VM's compute node — analogous to today's FIP /32 logic, but with the
 **internal** address and into the **DC fabric** (not the internet).
 
 **Work items:**
-- [ ] Announce the VM's IRIP as a /32 internally on the compute host (extension/variant of the existing `ovn-route-agent`).
+- [ ] Announce the VM's IRIP as a /32 internally on the compute host (extension/variant of the existing `ovn-network-agent`).
 - [ ] Ensure OVN delivers the IRIP to the VM (pure routing, no NAT).
 
-### 6.6 `ovn-route-agent`: adjust behavior
+### 6.6 `ovn-network-agent`: adjust behavior
 
 Since **no** OVN NAT entries exist anymore for `external-nat` FIPs, the existing
-`ovn-route-agent` will not see these FIPs — which is correct: the **FIP /32 is now announced by
+`ovn-network-agent` will not see these FIPs — which is correct: the **FIP /32 is now announced by
 the NAT layer**, no longer by OVN. For the internal path, the agent announces the **IRIP**
 (§6.5).
 
@@ -358,7 +358,7 @@ User → Neutron: floating ip create + set --port
        - bind_nat(FIP, fixed_ip, port) → master
   4. Master: assign IRIP, nat_state=pending, export to NAT layer
   5. NAT layer: 1:1 rule FIP↔IRIP, FIP/32 BGP → internet; nat_state=active
-  6. ovn-route-agent: announce IRIP/32 internally
+  6. ovn-network-agent: announce IRIP/32 internally
 ```
 
 ### 7.2 Inbound packet (internet → VM)
@@ -407,7 +407,7 @@ delete/disassociate → L3 driver: unbind_nat → master: nat_state=unbound,
 ### Phase 2 — Suppress OVN realization (the actual core)
 - [ ] L3 flavor `external-nat` + passthrough driver (§6.1).
 - [ ] Verify: **no** `dnat_and_snat` row for these FIPs.
-- [ ] `ovn-route-agent` IRIP announcement (§6.5/§6.6).
+- [ ] `ovn-network-agent` IRIP announcement (§6.5/§6.6).
 
 ### Phase 3 — Hardening
 - [ ] HA for the NAT layer (anycast/ECMP), reconcile robustness.
@@ -464,7 +464,7 @@ reconcile_interval = 30
 - New **L3 flavor driver** (`external-nat`) — suppresses OVN NAT, exports the mapping.
 - **Master data model** extended with mapping + IRIP pool; new `/v1/nat/*` endpoints.
 - **External NAT layer** as a new data-path component (outside OpenStack).
-- **`ovn-route-agent`**: no longer announces a public /32 for these FIPs, instead the internal IRIP.
+- **`ovn-network-agent`**: no longer announces a public /32 for these FIPs, instead the internal IRIP.
 
 > **Result:** EAB becomes, from a pure *address bookkeeper*, a *mapping service* in the AWS
 > sense; the L3 flavor driver becomes the counterpart of the *distributed Internet Gateway*;

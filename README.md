@@ -53,21 +53,27 @@ Components:
   on external networks, the local EAB agent is contacted. All other
   allocations are delegated to the standard IPAM driver (NeutronDbPool).
 
-## 3. Network-Side Counterpart: ovn-route-agent
+## 3. Network-Side Counterpart: ovn-network-agent
+
+> This section describes the **default, OVN-native** floating IP realization. An alternative
+> model that realizes the NAT *outside* of OVN is described in
+> [Section 13](#13-external-nat-realization-aws-style); the two are alternatives selected per
+> router, and the agent is needed in both (see [Section 3.4](#34-two-realization-paths-one-agent)).
 
 The External Address Broker ensures that floating IPs are uniquely allocated
 across all CloudPods. However, once an IP is allocated, it still needs to be
 reachable from outside — this is where the
-[ovn-route-agent](https://github.com/osism/ovn-route-agent) comes in.
+[ovn-network-agent](https://github.com/osism/ovn-route-agent) (formerly `ovn-route-agent`)
+comes in.
 
-The `ovn-route-agent` is an event-driven daemon that runs on the **Network Nodes**
+The `ovn-network-agent` is an event-driven daemon that runs on the **Network Nodes**
 (gateway chassis) of each CloudPod. It watches the OVN Southbound and Northbound
 databases in real time via the OVSDB protocol and synchronizes the routing state
 for floating IPs into the local network stack.
 
 ### 3.1 What it does
 
-When a floating IP is assigned (via Neutron / the EAB), the ovn-route-agent
+When a floating IP is assigned (via Neutron / the EAB), the ovn-network-agent
 detects the corresponding NAT entry in OVN and:
 
 1. **Creates a /32 host route** in the kernel for the floating IP
@@ -99,7 +105,7 @@ conflict-free routing:
    │  Network Node        │                 │  Network Node           │
    │  CloudPod A          │                 │  CloudPod B             │
    │                      │                 │                         │
-   │  ovn-route-agent     │                 │  ovn-route-agent        │
+   │  ovn-network-agent   │                 │  ovn-network-agent      │
    │  announces:          │                 │  announces:             │
    │    198.51.100.42/32  │                 │    198.51.100.43/32     │
    │    198.51.100.50/32  │                 │    198.51.100.51/32     │
@@ -108,17 +114,17 @@ conflict-free routing:
 
 - The **EAB** guarantees that `.42` is only ever allocated in CloudPod A and
   `.43` only in CloudPod B — no duplicates across CloudPods.
-- The **ovn-route-agent** ensures that only the Network Node holding the
+- The **ovn-network-agent** ensures that only the Network Node holding the
   respective floating IP announces its /32 route via BGP — no conflicting
   routes from different chassis.
 
-Without the ovn-route-agent, the /32 routes would not be announced and external
+Without the ovn-network-agent, the /32 routes would not be announced and external
 traffic would have no path to reach the floating IPs. Without the EAB, two
 CloudPods could allocate the same IP and both announce conflicting /32 routes.
 
 ### 3.3 Prerequisites
 
-The ovn-route-agent requires:
+The ovn-network-agent requires:
 
 - TCP access to the OVN Southbound and Northbound databases
 - FRR with `vtysh` available for BGP route injection
@@ -126,7 +132,29 @@ The ovn-route-agent requires:
 - Root or `CAP_NET_ADMIN` capabilities
 
 For installation and configuration details, see the
-[ovn-route-agent repository](https://github.com/osism/ovn-route-agent).
+[ovn-network-agent repository](https://github.com/osism/ovn-route-agent).
+
+### 3.4 Two realization paths, one agent
+
+This section describes the **default, OVN-native** realization: the floating IP becomes a
+`dnat_and_snat` entry in OVN and the `ovn-network-agent` announces the **public FIP /32**.
+[Section 13](#13-external-nat-realization-aws-style) describes an **alternative** in which the
+NAT is applied outside of OVN and no OVN NAT entry is created.
+
+The two paths are **alternatives selected per router** (via an L3 flavor), **not** a
+replacement of one by the other. The `ovn-network-agent` is required in **both** — only its job
+changes:
+
+| | Default (OVN-native, this section) | External NAT (Section 13) |
+|---|---|---|
+| NAT location | OVN `dnat_and_snat` | external NAT layer |
+| What the agent announces | the public **FIP** /32 | the internal **IRIP** /32 |
+| Where it announces | toward the upstream / internet | toward the DC fabric (internal) |
+| Agent trigger | the OVN **NAT entry** | the VM **port / IRIP binding** |
+
+For OVN-flavor routers the agent announces FIPs (as today); for `external-nat`-flavor routers it
+announces IRIPs and never the FIP. The EAB allocation core (Sections 4–6) is unchanged and
+required on both paths.
 
 ## 4. Component: Neutron IPAM Driver
 
@@ -2163,7 +2191,7 @@ curl -X POST https://eab-master:9533/v1/addresses/release \
 
 By default, once the EAB has allocated a floating IP, it is *realized* inside OVN: Neutron
 writes a single `dnat_and_snat` entry into the OVN northbound `NAT` table, and the
-[ovn-route-agent](#3-network-side-counterpart-ovn-route-agent) announces the corresponding
+[ovn-network-agent](#3-network-side-counterpart-ovn-network-agent) announces the corresponding
 /32 route via BGP (see Section 3).
 
 An alternative, more AWS-like model **decouples allocation from realization entirely**: the
@@ -2177,12 +2205,13 @@ address.
 |---|---|---|
 | **Allocation** (who owns the IP) | Neutron IPAM → EAB | Neutron IPAM → EAB (unchanged) |
 | **Association** (FIP ↔ VM) | Neutron `floatingip` | Neutron `floatingip` (unchanged) |
-| **Realization / NAT** | OVN `dnat_and_snat` + ovn-route-agent /32 | external NAT layer, **not in OVN** |
+| **Realization / NAT** | OVN `dnat_and_snat`; agent announces **FIP** /32 | external NAT layer; agent announces **IRIP** /32; **not in OVN** |
 
 ```
-   Default:   Neutron/EAB ─► OVN dnat_and_snat ─► ovn-route-agent ─► BGP /32
-   External:  Neutron/EAB ─► L3 flavor driver (no OVN NAT) ─► external NAT layer ─► BGP /32
+   Default:   Neutron/EAB ─► OVN dnat_and_snat ─► ovn-network-agent announces FIP /32
+   External:  Neutron/EAB ─► L3 flavor driver (no OVN NAT) ─► external NAT layer announces FIP /32
                                                               (stateless 1:1 FIP↔IRIP)
+              └─ ovn-network-agent still runs, announcing the internal IRIP /32 instead
 ```
 
 The realization is suppressed in OVN via a custom **L3 flavor / service-provider driver**
@@ -2190,6 +2219,12 @@ The realization is suppressed in OVN via a custom **L3 flavor / service-provider
 external, stateless 1:1 NAT layer (e.g. nftables+FRR, VPP, or a DPU). OVN keeps doing plain
 internal routing of a unique *internal routable IP* (IRIP); the public FIP never appears in
 the overlay.
+
+**This is an alternative, not a replacement.** The default OVN-native path (Section 3) and the
+EAB allocation core remain in place, and the `ovn-network-agent` is still required — under
+external NAT it announces the internal **IRIP** /32 instead of the public **FIP** /32 (see
+[Section 3.4](#34-two-realization-paths-one-agent)). The two paths coexist and are chosen per
+router via the L3 flavor.
 
 For the full design — the L3 flavor driver, the EAB master data-model and `/v1/nat/*` API
 extensions, the IRIP pool, the external NAT layer, end-to-end packet flows, and a phased
