@@ -138,6 +138,35 @@ avoids the overlap problem and fits EAB's already centrally managed address spac
 encapsulates with a per-tenant VNI (becomes an OVN chassis / EVPN Type-5). More powerful but
 significantly more complex, and deliberately **out of scope** here (see §10).
 
+### 5.1 How the IRIP reaches the VM port
+
+"The DC fabric routes the IRIP to the VM" needs a concrete mechanism on the last hop: the
+packet arriving at the tenant router still has `dst = IRIP`, and OVN port security only
+accepts/emits addresses the port actually owns. Three options:
+
+**Option A — IRIP = the VM's fixed IP.** The tenant subnet is carved out of the
+operator-managed IRIP space (no tenant-chosen CIDRs on such networks). No guest changes, no
+NAT in OVN at all — but tenants lose free choice of their subnets, and *every* VM (not just
+FIP holders) consumes IRIP space.
+
+**Option B — IRIP as a second address on the port.** The IRIP is added as an
+allowed-address-pair (and configured inside the guest, e.g. via cloud-init), plus a /32 route
+`IRIP → fixed IP` on the tenant router. Works without touching tenant CIDRs, but outbound
+traffic must be *sourced* from the IRIP by the guest — fragile in practice.
+
+**Option C — OVN translates IRIP ↔ fixed IP (recommended).** The router keeps a
+`dnat_and_snat` entry, but with `external_ip = IRIP` instead of the public FIP. Mechanically
+this is exactly today's FIP realization — only with an internal, operator-owned address. The
+guest is untouched, tenant CIDRs may overlap, port security is satisfied, and the
+`ovn-network-agent` can reuse its existing NAT-entry-driven logic almost unchanged (it
+announces the IRIP /32 it finds in the NAT table into the fabric). The goal of this document
+is preserved: the *public* FIP still never appears anywhere in OVN.
+
+With Option C the L3 flavor driver does not suppress the NAT row entirely; it **replaces the
+NAT target**: instead of `external_ip = FIP` it writes `external_ip = IRIP` (allocated from
+the EAB IRIP pool). Options A/B keep OVN completely NAT-free but push the complexity into
+tenant addressing (A) or into the guest (B).
+
 ---
 
 ## 6. Components and Concrete Work Items
@@ -147,6 +176,15 @@ significantly more complex, and deliberately **out of scope** here (see §10).
 **Mechanism.** Since release 2023.2, the OVN L3 functionality (routers *and* floating IPs) has
 been refactored into a swappable driver. Via the **flavor / service-provider framework**, a
 custom driver can be loaded per router to handle realization.
+
+> **Caveat — the flavor framework skips the *whole* router.** The OVN L3 plugin does not
+> process routers with a user-defined flavor *at all*: not only the FIP operations are
+> skipped, but also router create/update, interfaces, and the gateway. A "passthrough"
+> driver therefore does not get OVN router realization "for free" — it must explicitly
+> re-delegate router/interface/gateway operations to the OVN backend (e.g. by invoking
+> `OVNClient` itself), or the routers must be realized by other means. Validating this
+> delegation against the target release is the single biggest feasibility risk of this
+> design (see §10).
 
 **Approach — "passthrough driver that overrides only FIP operations":**
 
@@ -234,8 +272,12 @@ class ExternalNatL3Driver(base.L3ServiceProvider):
 
 **Work items:**
 - [ ] Implement the driver module `l3/driver.py` (override FIP events, delegate routers to OVN).
+- [ ] Re-delegate router/interface/gateway realization to the OVN backend (the flavor
+      framework skips user-defined-flavor routers entirely; see the caveat above).
+- [ ] Decide the IRIP attachment variant (§5.1); with Option C the driver does not suppress
+      the NAT row but writes it with `external_ip = IRIP` instead of the public FIP.
 - [ ] `setup.cfg`: register the entry point / service provider.
-- [ ] Verify that **no** `dnat_and_snat` row is created in OVN NB for FIPs on `external-nat` routers (`ovn-nbctl lr-nat-list`).
+- [ ] Verify that **no** `dnat_and_snat` row **with a public FIP** is created in OVN NB for FIPs on `external-nat` routers (`ovn-nbctl lr-nat-list`).
 - [ ] Check the release-specific base class / module paths against the target version (e.g. 2024.1/2024.2).
 
 ### 6.2 EAB master: extend data model + API
@@ -280,6 +322,8 @@ GET  /v1/nat/mappings -> all active FIP↔IRIP mappings (for reconcile/export)
 - [ ] Add `InternalAddress` table + IRIP pool allocation (analogous to `_find_free_ip`).
 - [ ] Implement `/v1/nat/bind` + `/v1/nat/unbind` + `/v1/nat/mappings`.
 - [ ] Idempotency + reconcile (mapping list as source of truth for the NAT layer).
+- [ ] Lifecycle edge cases: FIP re-association (port change ⇒ move/release the IRIP), IRIP
+      release on unbind, one IRIP per port vs. one per FIP.
 
 ### 6.3 EAB agent: export to the NAT layer
 
@@ -302,9 +346,15 @@ ECMP), optionally VPP/DPU later.
 Example (per mapping `FIP ↔ IRIP`):
 
 ```bash
-# 1:1 NAT (stateless, no conntrack needed)
-nft add rule ip nat PREROUTING  ip daddr 198.51.100.42 dnat to 10.128.0.5
-nft add rule ip nat POSTROUTING ip saddr 10.128.0.5    snat to 198.51.100.42
+# Truly stateless 1:1 rewrite. Note: the classic nftables 'dnat to' /
+# 'snat to' statements are CONNTRACK-BASED — with anycast/ECMP the two
+# directions of a flow may hit different NAT nodes, so no per-flow state
+# may be required. Use raw-priority header rewrites with notrack instead
+# (both directions transit the box, so both rules live in prerouting):
+nft add table ip eab
+nft add chain ip eab prerouting '{ type filter hook prerouting priority raw; }'
+nft add rule ip eab prerouting ip daddr 198.51.100.42 notrack ip daddr set 10.128.0.5
+nft add rule ip eab prerouting ip saddr 10.128.0.5 notrack ip saddr set 198.51.100.42
 
 # Announce the FIP /32 to the internet (FRR)
 vtysh -c 'configure terminal' \
@@ -317,10 +367,28 @@ Properties: stateless ⇒ any NAT instance can hold any rule ⇒ trivially redun
 anycast/ECMP. The NAT layer routes the IRIP sources toward the internet (SNAT), and the DC
 fabric routes inbound IRIP destinations to the VM (via internal BGP, §6.5).
 
+Because *all* FIPs of an external-nat pool terminate at the NAT layer, the NAT nodes can
+announce the **aggregate pool prefix** (e.g. `198.51.100.0/24`) instead of one /32 per FIP —
+no BGP churn on FIP create/delete, and unmapped FIPs are simply dropped at the NAT layer.
+This requires the pool to be realized *exclusively* via external NAT: if OVN-native FIPs
+share the same pool, their more-specific /32s must keep working, so mixed pools must stay on
+per-/32 announcements. Recommendation: use separate managed subnets per realization path.
+
+Two limits of statelessness worth stating explicitly: (1) no port-overloading — each FIP
+consumes a full public IP (which is the AWS EIP model anyway); (2) the NAT layer cannot
+provide a shared N:1 SNAT for VMs *without* a FIP — those need a separate stateful egress
+service, or deliberately get no internet access (see §10).
+
 **Work items:**
 - [ ] NAT controller that consumes `/v1/nat/mappings` and programs nftables + FRR.
 - [ ] HA: ≥2 NAT nodes, ECMP/anycast, identical rule set (stateless ⇒ no state sync).
 - [ ] Ensure the outbound default route of the IRIP sources goes through the NAT layer.
+- [ ] Ensure outbound traffic is *sourced* from the IRIP: for §5.1 options A/B set
+      `enable_snat=false` on `external-nat` routers (otherwise traffic egresses with the
+      router's gateway IP); for option C the per-port `dnat_and_snat (external_ip = IRIP)`
+      covers it, and router-level SNAT only affects FIP-less VMs.
+- [ ] Announce the aggregate pool prefix from the NAT nodes where a pool is realized
+      *exclusively* via external NAT (otherwise per-/32, see above).
 
 ### 6.5 Internal routability of the IRIP (`ovn-network-agent`)
 
@@ -334,10 +402,13 @@ via BGP from the VM's compute node — analogous to today's FIP /32 logic, but w
 
 ### 6.6 `ovn-network-agent`: adjust behavior
 
-Since **no** OVN NAT entries exist anymore for `external-nat` FIPs, the existing
-`ovn-network-agent` will not see these FIPs — which is correct: the **FIP /32 is now announced by
-the NAT layer**, no longer by OVN. For the internal path, the agent announces the **IRIP**
-(§6.5).
+Since no OVN NAT entries **with a public FIP** exist anymore for `external-nat` FIPs, the
+existing `ovn-network-agent` will not see these FIPs — which is correct: the **FIP /32 is now
+announced by the NAT layer**, no longer by OVN. For the internal path, the agent announces the
+**IRIP** (§6.5). With IRIP attachment Option C (§5.1) the agent can derive the IRIP from the
+`dnat_and_snat` row whose `external_ip` is the IRIP — its existing NAT-entry-driven logic
+applies almost unchanged, only the announcement target changes (DC fabric instead of
+upstream).
 
 **Work items:**
 - [ ] Disable public-FIP announcement for `external-nat` routers (no OVN NAT source present anymore — usually automatic).
@@ -406,7 +477,9 @@ delete/disassociate → L3 driver: unbind_nat → master: nat_state=unbound,
 
 ### Phase 2 — Suppress OVN realization (the actual core)
 - [ ] L3 flavor `external-nat` + passthrough driver (§6.1).
-- [ ] Verify: **no** `dnat_and_snat` row for these FIPs.
+- [ ] Router/interface/gateway delegation to the OVN backend verified (§6.1 caveat).
+- [ ] Decide + implement the IRIP attachment variant (§5.1).
+- [ ] Verify: no `dnat_and_snat` row **with a public FIP** for these FIPs.
 - [ ] `ovn-network-agent` IRIP announcement (§6.5/§6.6).
 
 ### Phase 3 — Hardening
@@ -447,9 +520,11 @@ reconcile_interval = 30
 |---|---|
 | **IRIP uniqueness** | Variant A requires non-overlapping internal addresses on the path NAT↔OVN. EAB manages the IRIP pool centrally. Overlapping tenant CIDRs ⇒ future option encap/EVPN (out of scope). |
 | **Dual source of truth** | FIP↔IRIP exists in the Neutron DB *and* EAB master *and* NAT layer. Reconcile (`/v1/nat/mappings`) makes the master authoritative. |
-| **L3 flavor maturity** | Flavor/driver refactor since 2023.2; test the FIP path against the concrete target version (module paths, event signatures). |
+| **L3 flavor maturity** | Flavor/driver refactor since 2023.2; test against the concrete target version (module paths, event signatures). **The framework skips user-defined-flavor routers entirely** — router/interface/gateway realization must be explicitly re-delegated to the OVN backend (§6.1). This is the main feasibility risk. |
 | **Outbound steering** | The default route of the IRIP sources must reliably traverse the NAT layer (fabric policy/routing). |
 | **Security groups / conntrack** | Stateless 1:1 NAT has no own state; security groups remain effective in OVN at the VM port (IRIP side). Check inbound/outbound asymmetry. |
+| **IRIP attachment** | "OVN routes the IRIP to the VM" needs a concrete last-hop mechanism (§5.1). Option C (OVN translates IRIP ↔ fixed IP) is the pragmatic default; options A/B trade OVN purity against tenant addressing constraints or guest cooperation. |
+| **Egress for FIP-less VMs** | A stateless NAT layer cannot provide shared N:1 SNAT. VMs without a FIP behind an `external-nat` router need a separate stateful egress service — or deliberately get no internet access. |
 | **MTU** | No extra header with pure NAT (no overlay overhead) — an advantage over the encap variant. |
 
 ---

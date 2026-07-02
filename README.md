@@ -246,8 +246,21 @@ install_requires =
     oslo.config>=9.0.0
     oslo.log>=5.0.0
     requests>=2.28.0
+
+[options.extras_require]
+# The IPAM driver is imported into neutron-server and must stay lightweight;
+# agent and master pull their service dependencies via extras
+# (pip install networking-external-address-broker[agent]).
+agent =
     fastapi>=0.115.0
     uvicorn>=0.34.0
+master =
+    fastapi>=0.115.0
+    uvicorn>=0.34.0
+    SQLAlchemy>=2.0
+    alembic>=1.13
+    netaddr>=1.0
+    oslo.utils>=7.0.0
 
 [options.packages.find]
 exclude =
@@ -508,38 +521,23 @@ class ExternalAddressBrokerAddressRequestFactory(
 
     @classmethod
     def get_request(cls, context, port, ip_dict):
-        # Only intercept floating IP ports on external networks
-        if (port.get('device_owner') == constants.DEVICE_OWNER_FLOATINGIP
-                and not ip_dict.get('ip_address')):
-            network_id = port.get('network_id')
-            try:
-                if _is_external_network(context, network_id):
-                    return cls._request_from_broker(
-                        context, port, ip_dict,
-                    )
-            except Exception:
-                LOG.exception(
-                    'Error checking external network status for %s',
-                    network_id,
-                )
+        # Only intercept floating IP ports; everything else (DHCP, router,
+        # regular ports, ...) uses the default behavior.
+        if port.get('device_owner') != constants.DEVICE_OWNER_FLOATINGIP:
+            return super().get_request(context, port, ip_dict)
 
-        # Specific IP address requested for a floating IP
-        if (port.get('device_owner') == constants.DEVICE_OWNER_FLOATINGIP
-                and ip_dict.get('ip_address')):
-            network_id = port.get('network_id')
-            try:
-                if _is_external_network(context, network_id):
-                    return cls._request_specific_from_broker(
-                        context, port, ip_dict,
-                    )
-            except Exception:
-                LOG.exception(
-                    'Error during specific broker reservation for %s',
-                    ip_dict['ip_address'],
-                )
+        # Fail closed: if the external-network check raises, the request
+        # fails instead of falling through to the local allocator.
+        if not _is_external_network(context, port.get('network_id')):
+            return super().get_request(context, port, ip_dict)
 
-        # Default for everything else (DHCP, router, regular ports, ...)
-        return super().get_request(context, port, ip_dict)
+        # Broker errors (agent unreachable, pool exhausted) must propagate.
+        # If they were caught here, the request would fall through to the
+        # local allocator and silently bypass the duplicate protection —
+        # even with fallback_to_local = false.
+        if ip_dict.get('ip_address'):
+            return cls._request_specific_from_broker(context, port, ip_dict)
+        return cls._request_from_broker(context, port, ip_dict)
 
     @classmethod
     def _request_from_broker(cls, context, port, ip_dict):
@@ -654,24 +652,38 @@ def release_floating_ip_on_delete(resource, event, trigger, payload):
 ### 4.8 Callback Registration
 
 Registration happens automatically via the `@registry.receives` decorator.
-For the callback to be loaded, the module must be imported. This is done
-via an additional entry point:
+For the callback to be loaded, the module must be imported. The most robust
+place is the IPAM driver module itself — it is guaranteed to be imported by
+neutron-server whenever `ipam_driver = external_address_broker` is set:
 
-```ini
-# In setup.cfg
-neutron.policies =
-    eab_callbacks = networking_external_address_broker.callbacks.floating_ip
+```python
+# At the bottom of networking_external_address_broker/ipam/driver.py
+from networking_external_address_broker.callbacks import floating_ip  # noqa: F401,E402
 ```
 
-Alternatively, a `NeutronModule` entry point can be used, or the import
-can be ensured in the package's `__init__.py`.
+(Abusing an unrelated entry-point group such as `neutron.policies` to force
+the import works, but is surprising to operators and may break on Neutron
+upgrades.)
+
+Note that the `AFTER_DELETE` callback alone does not cover every
+deallocation path: if the port creation fails *after* the broker reservation
+succeeded (quota error, DB deadlock/rollback, ...), Neutron rolls back the
+IPAM allocation without emitting a floating IP `AFTER_DELETE` event. Such
+leaked reservations are cleaned up by the periodic sync (Section 7.3). A
+planned improvement is to also release from the IPAM deallocate path itself
+(see Section 12.2).
 
 ## 5. Component: EAB Agent (per CloudPod)
 
 The EAB agent runs as a standalone service on each CloudPod. It mediates
 between the Neutron IPAM driver (local) and the EAB master (central).
 
-### 6.1 Responsibilities
+In deployments with multiple controller nodes, run one agent instance on
+every node where neutron-server runs (the driver talks to `localhost`), or
+run the agents behind a pod-local VIP. Apart from its cache the agent is
+stateless, so any number of instances can run in parallel.
+
+### 5.1 Responsibilities
 
 - Accepts reserve/release requests from the IPAM driver
 - Forwards these to the EAB master
@@ -721,6 +733,16 @@ heartbeat_interval = 10
 # Local cache for allocations
 # Allows fast lookups without master roundtrip
 enabled = true
+
+[neutron]
+# Read-only Keystone credentials used by the reconcile loop to list the
+# floating IPs that exist locally in Neutron (see Section 7.3).
+auth_url = https://keystone.cloudpod-a.example.com/v3
+username = eab-agent
+password = <secret>
+project_name = service
+user_domain_name = Default
+project_domain_name = Default
 ```
 
 ### 5.3 API (local, only reachable from Neutron)
@@ -845,7 +867,8 @@ async def _sync_loop():
     """Periodic reconciliation with the master."""
     while True:
         try:
-            allocations = _master.get_allocations()
+            # requests is blocking — keep it off the event loop
+            allocations = await asyncio.to_thread(_master.get_allocations)
             _cache.full_sync(allocations)
             LOG.debug('Full sync completed, %d entries', len(allocations))
         except Exception:
@@ -857,7 +880,7 @@ async def _heartbeat_loop():
     """Periodic heartbeat to the master."""
     while True:
         try:
-            _master.heartbeat()
+            await asyncio.to_thread(_master.heartbeat)
         except Exception:
             LOG.warning('Heartbeat to master failed')
         await asyncio.sleep(_config.sync.heartbeat_interval)
@@ -1162,9 +1185,13 @@ bind_port = 9533
 connection = postgresql://eab:password@localhost:5432/eab_master
 
 [auth]
-# Comma-separated list of valid agent tokens
+# Comma-separated cloudpod:token pairs. Binding each token to a CloudPod ID
+# is what enforces that an agent can only act for its own CloudPod (11.3).
 # In production: Keystone or another auth service
-agent_tokens = token-cloudpod-a,token-cloudpod-b,token-cloudpod-c
+agent_tokens = cloudpod-a:token-a,cloudpod-b:token-b,cloudpod-c:token-c
+
+# Separate token for the /v1/admin/* endpoints
+admin_token = <admin-token>
 
 [cleanup]
 # Interval in seconds for checking orphaned allocations
@@ -1328,6 +1355,7 @@ class Allocation(Base):
 # eab_master/api/v1.py
 
 import datetime
+import hmac
 from collections.abc import Generator
 from typing import Annotated
 
@@ -1404,12 +1432,26 @@ def create_app(session_factory):
     def authenticate(
         authorization: Annotated[str, Header()] = '',
     ) -> str:
-        """Validates the agent token."""
+        """Validates the agent token and returns the CloudPod it is bound to.
+
+        The acting CloudPod is always derived from the token — never from
+        client-supplied headers or body fields. This is what enforces the
+        authorization model in Section 11.3.
+        """
         token = authorization.replace('Bearer ', '')
-        valid_tokens = cfg.CONF.auth.agent_tokens.split(',')
-        if token not in valid_tokens:
+        for pair in cfg.CONF.auth.agent_tokens.split(','):
+            cloudpod_id, pod_token = pair.split(':', 1)
+            if hmac.compare_digest(token, pod_token):
+                return cloudpod_id
+        raise HTTPException(status_code=401, detail='Unauthorized')
+
+    def authenticate_admin(
+        authorization: Annotated[str, Header()] = '',
+    ) -> None:
+        """Validates the admin token for /v1/admin/* endpoints."""
+        token = authorization.replace('Bearer ', '')
+        if not hmac.compare_digest(token, cfg.CONF.auth.admin_token):
             raise HTTPException(status_code=401, detail='Unauthorized')
-        return token
 
     # -----------------------------------------------------------------
     # Address Management
@@ -1419,100 +1461,112 @@ def create_app(session_factory):
     def reserve_address(
         data: ReserveRequest,
         db: Session = Depends(get_db),
-        _token: str = Depends(authenticate),
+        caller_pod: str = Depends(authenticate),
     ):
         """Atomically reserves an IP address.
 
         Expected body:
             - network_id: Neutron network UUID of the requesting CloudPod
-            - cloudpod_id: ID of the CloudPod
+            - cloudpod_id: ID of the CloudPod (must match the caller's token)
             - ip_address: (optional) specific IP
             - subnet_id: (optional) restriction to subnet
             - project_id: (optional) tenant/project
         """
-        try:
-            # Find mapping: which ManagedSubnet belongs to this
-            # CloudPod + network combination?
-            mapping = db.execute(
-                select(models.NetworkMapping).where(
-                    models.NetworkMapping.cloudpod_id == data.cloudpod_id,
-                    models.NetworkMapping.neutron_network_id == data.network_id,
-                )
-            ).scalar_one_or_none()
-
-            if not mapping:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f'No mapping found for CloudPod {data.cloudpod_id} '
-                           f'and network {data.network_id}',
-                )
-
-            managed_subnet = db.get(
-                models.ManagedSubnet, mapping.managed_subnet_id,
-            )
-            if not managed_subnet or not managed_subnet.is_active:
-                raise HTTPException(
-                    status_code=409, detail='Subnet is not active',
-                )
-
-            if data.ip_address:
-                # Reserve specific IP
-                alloc_ip = data.ip_address
-            else:
-                # Find next free IP
-                alloc_ip = _find_free_ip(db, managed_subnet)
-                if not alloc_ip:
-                    raise HTTPException(
-                        status_code=409,
-                        detail='No free IP address available',
-                    )
-
-            reservation_id = uuidutils.generate_uuid()
-            allocation = models.Allocation(
-                ip_address=alloc_ip,
-                managed_subnet_id=managed_subnet.id,
-                cloudpod_id=data.cloudpod_id,
-                project_id=data.project_id,
-                reservation_id=reservation_id,
-            )
-            db.add(allocation)
-            db.commit()
-
-            return {
-                'ip_address': alloc_ip,
-                'subnet_id': mapping.neutron_subnet_id,
-                'network_id': data.network_id,
-                'reservation_id': reservation_id,
-            }
-
-        except IntegrityError:
-            db.rollback()
+        if data.cloudpod_id != caller_pod:
             raise HTTPException(
-                status_code=409,
-                detail=f'IP {data.ip_address} is already allocated',
+                status_code=403,
+                detail='Token is not valid for this CloudPod',
             )
 
-        except HTTPException:
-            raise
+        # Find mapping: which ManagedSubnet belongs to this
+        # CloudPod + network combination?
+        mapping = db.execute(
+            select(models.NetworkMapping).where(
+                models.NetworkMapping.cloudpod_id == data.cloudpod_id,
+                models.NetworkMapping.neutron_network_id == data.network_id,
+            )
+        ).scalar_one_or_none()
 
-        except Exception:
-            db.rollback()
-            LOG.exception('Error during reservation')
-            raise HTTPException(status_code=500, detail='Internal error')
+        if not mapping:
+            raise HTTPException(
+                status_code=404,
+                detail=f'No mapping found for CloudPod {data.cloudpod_id} '
+                       f'and network {data.network_id}',
+            )
+
+        managed_subnet = db.get(
+            models.ManagedSubnet, mapping.managed_subnet_id,
+        )
+        if not managed_subnet or not managed_subnet.is_active:
+            raise HTTPException(
+                status_code=409, detail='Subnet is not active',
+            )
+
+        if data.ip_address:
+            # Specific IP: validate against the managed pool first —
+            # otherwise any typo becomes a permanent allocation record.
+            pool = netaddr.IPRange(
+                managed_subnet.pool_start, managed_subnet.pool_end,
+            )
+            if netaddr.IPAddress(data.ip_address) not in pool:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f'IP {data.ip_address} is outside the managed '
+                           f'pool {managed_subnet.pool_start}-'
+                           f'{managed_subnet.pool_end}',
+                )
+            try:
+                return _insert_allocation(
+                    db, data, mapping, managed_subnet, data.ip_address,
+                )
+            except IntegrityError:
+                db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=f'IP {data.ip_address} is already allocated',
+                )
+
+        # Automatic allocation: two CloudPods may race for the same "next
+        # free" IP. The UNIQUE constraint makes the loser fail with an
+        # IntegrityError — retry with the next candidate instead of
+        # reporting pool exhaustion (see Section 8.3).
+        for _attempt in range(5):
+            alloc_ip = _find_free_ip(db, managed_subnet)
+            if not alloc_ip:
+                raise HTTPException(
+                    status_code=409,
+                    detail='No free IP address available',
+                )
+            try:
+                return _insert_allocation(
+                    db, data, mapping, managed_subnet, alloc_ip,
+                )
+            except IntegrityError:
+                db.rollback()
+                LOG.info('Lost allocation race for %s, retrying', alloc_ip)
+
+        raise HTTPException(
+            status_code=503,
+            detail='Could not allocate an IP after several attempts',
+        )
 
     @app.post('/v1/addresses/release')
     def release_address(
         data: ReleaseRequest,
-        x_cloudpod_id: Annotated[str, Header()],
         db: Session = Depends(get_db),
-        _token: str = Depends(authenticate),
+        caller_pod: str = Depends(authenticate),
     ):
-        """Releases an IP address."""
+        """Releases an IP address.
+
+        The allocation is looked up via the *authenticated* CloudPod
+        (derived from the token), never via client-supplied headers — an
+        agent cannot release an address held by another CloudPod.
+        """
         try:
             allocation = db.execute(
                 select(models.Allocation).where(
                     models.Allocation.ip_address == data.ip_address,
-                    models.Allocation.cloudpod_id == x_cloudpod_id,
+                    models.Allocation.cloudpod_id == caller_pod,
                 )
             ).scalar_one_or_none()
 
@@ -1526,7 +1580,7 @@ def create_app(session_factory):
 
             LOG.info(
                 'IP %s released (CloudPod: %s)',
-                data.ip_address, x_cloudpod_id,
+                data.ip_address, caller_pod,
             )
             return {
                 'ip_address': data.ip_address,
@@ -1583,8 +1637,13 @@ def create_app(session_factory):
     def cloudpod_heartbeat(
         data: HeartbeatRequest,
         db: Session = Depends(get_db),
-        _token: str = Depends(authenticate),
+        caller_pod: str = Depends(authenticate),
     ):
+        if data.cloudpod_id != caller_pod:
+            raise HTTPException(
+                status_code=403,
+                detail='Token is not valid for this CloudPod',
+            )
         cloudpod = db.get(models.CloudPod, data.cloudpod_id)
         if not cloudpod:
             raise HTTPException(
@@ -1626,7 +1685,7 @@ def create_app(session_factory):
     @app.get('/v1/admin/subnets')
     def list_managed_subnets(
         db: Session = Depends(get_db),
-        _token: str = Depends(authenticate),
+        _admin: None = Depends(authenticate_admin),
     ):
         subnets = db.execute(
             select(models.ManagedSubnet)
@@ -1649,7 +1708,7 @@ def create_app(session_factory):
     def create_managed_subnet(
         data: CreateSubnetRequest,
         db: Session = Depends(get_db),
-        _token: str = Depends(authenticate),
+        _admin: None = Depends(authenticate_admin),
     ):
         try:
             subnet = models.ManagedSubnet(
@@ -1673,7 +1732,7 @@ def create_app(session_factory):
     def create_cloudpod(
         data: CreateCloudPodRequest,
         db: Session = Depends(get_db),
-        _token: str = Depends(authenticate),
+        _admin: None = Depends(authenticate_admin),
     ):
         try:
             cloudpod = models.CloudPod(
@@ -1694,7 +1753,7 @@ def create_app(session_factory):
     def create_network_mapping(
         data: CreateMappingRequest,
         db: Session = Depends(get_db),
-        _token: str = Depends(authenticate),
+        _admin: None = Depends(authenticate_admin),
     ):
         try:
             mapping = models.NetworkMapping(
@@ -1715,7 +1774,7 @@ def create_app(session_factory):
     @app.get('/v1/admin/mappings')
     def list_network_mappings(
         db: Session = Depends(get_db),
-        _token: str = Depends(authenticate),
+        _admin: None = Depends(authenticate_admin),
     ):
         mappings = db.execute(
             select(models.NetworkMapping)
@@ -1764,6 +1823,26 @@ def _find_free_ip(db, managed_subnet):
             return ip_str
 
     return None
+
+
+def _insert_allocation(db, data, mapping, managed_subnet, alloc_ip):
+    """Inserts one allocation row; raises IntegrityError on conflicts."""
+    reservation_id = uuidutils.generate_uuid()
+    allocation = models.Allocation(
+        ip_address=alloc_ip,
+        managed_subnet_id=managed_subnet.id,
+        cloudpod_id=data.cloudpod_id,
+        project_id=data.project_id,
+        reservation_id=reservation_id,
+    )
+    db.add(allocation)
+    db.commit()
+    return {
+        'ip_address': alloc_ip,
+        'subnet_id': mapping.neutron_subnet_id,
+        'network_id': data.network_id,
+        'reservation_id': reservation_id,
+    }
 ```
 
 ### 6.6 Master App Entry Point
@@ -1790,6 +1869,8 @@ def main():
     log.setup(cfg.CONF, 'eab-master')
 
     engine = create_engine(cfg.CONF.database.connection)
+    # Bootstrap convenience only — production deployments should manage the
+    # schema via the Alembic migrations in eab_master/db/migration/.
     models.Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine)
 
@@ -1906,6 +1987,15 @@ EAB Agent                                EAB Master
  |                                          |
 ```
 
+To avoid racing an in-flight floating IP creation (already reserved at the
+master, but the Neutron transaction not yet committed), the agent only
+releases allocations that are absent from Neutron if they are older than a
+grace period (e.g. `2 * full_sync_interval`, based on `allocated_at`).
+
+The comparison against "local Neutron FIPs" requires the agent to read the
+local Neutron state; it uses the read-only Keystone credentials from the
+`[neutron]` config section (see Section 5.2).
+
 ## 8. Error Scenarios and Handling
 
 ### 8.1 Master Unreachable During Reserve
@@ -1989,6 +2079,32 @@ Behavior:
       (the CloudPod might still be announcing BGP routes)
     - Manual release via admin API once it is confirmed
       that the CloudPod is no longer using the IPs
+```
+
+### 8.6 Non-FIP Ports on the External Network (Router Gateways)
+
+```
+The IPAM driver only routes FLOATING IP allocations through the broker.
+Other ports on the external network — most importantly router gateway
+ports (device_owner = network:router_gateway), but also DHCP or service
+ports — are allocated by the local NeutronDbPool. Since all CloudPods use
+identical subnets, two CloudPods can assign the same gateway IP without
+the broker noticing — with the same conflict consequences as duplicate
+floating IPs.
+
+Recommended operating model:
+
+    1. Give the external subnet in each CloudPod a small, per-pod DISJOINT
+       allocation pool (e.g. pod A: .2-.9, pod B: .10-.17, ...). Automatic
+       local allocations (router gateways etc.) then come from a range
+       that is unique to the pod by construction.
+    2. Configure the broker-managed pool (pool_start/pool_end in the
+       ManagedSubnet) so that it does NOT overlap any of the local
+       allocation pools. Floating IPs are requested as specific addresses
+       and may therefore lie outside the local allocation pools.
+
+Alternative (Phase 3): route ALL allocations on managed external networks
+through the broker, not only floating IPs.
 ```
 
 ## 9. Setting Up a New Environment
@@ -2131,10 +2247,12 @@ curl https://eab-master:9533/v1/admin/subnets \
 curl https://eab-master:9533/v1/admin/mappings \
     -H "Authorization: Bearer $TOKEN"
 
-# Manual IP release (e.g. after CloudPod failure)
+# Manual IP release (e.g. after CloudPod failure).
+# Release authorization is derived from the token (each token is bound to
+# one CloudPod), so this uses the failed pod's agent token. A dedicated
+# admin force-release endpoint is planned (see Section 12.2).
 curl -X POST https://eab-master:9533/v1/addresses/release \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "X-CloudPod-ID: cloudpod-a" \
+    -H "Authorization: Bearer $TOKEN_CLOUDPOD_A" \
     -d '{"ip_address": "198.51.100.42", "network_id": "n/a"}'
 ```
 
@@ -2153,9 +2271,12 @@ curl -X POST https://eab-master:9533/v1/addresses/release \
 
 ### 11.3 Authorization
 
-- Agents can only reserve/release addresses for their own CloudPod
-  (enforced by X-CloudPod-ID header + token validation)
+- Agents can only reserve/release addresses for their own CloudPod:
+  each token is bound to exactly one CloudPod ID, and the master derives
+  the acting CloudPod from the token — never from client-supplied headers
+  or body fields
 - Admin endpoints (/v1/admin/*) require a separate admin token
+  (`[auth] admin_token`)
 
 ## 12. Open Items and Extensions
 
@@ -2169,8 +2290,23 @@ curl -X POST https://eab-master:9533/v1/addresses/release \
 
 ### 12.2 Phase 2
 
-- [ ] High availability: Master behind load balancer with
-      PostgreSQL replication
+- [ ] High availability: the master API is stateless — run two or more
+      replicas behind a load balancer on top of an HA PostgreSQL
+      (e.g. Patroni). Correctness is already guaranteed by the UNIQUE
+      constraint, not by having a single master process
+- [ ] Idempotent reserve: client-supplied idempotency key (e.g. the
+      Neutron port ID), so Neutron DB retries cannot create duplicate
+      allocations for the same request
+- [ ] Reservation leases: new allocations start as `pending` and expire
+      automatically unless confirmed (or observed via sync) — closes the
+      window in which failed Neutron transactions leak reservations
+- [ ] Release broker reservations from the IPAM deallocate path
+      (subclassed subnet driver) instead of relying only on the FIP
+      AFTER_DELETE callback plus sync (see Section 4.8)
+- [ ] Master background task that marks CloudPods offline after
+      cloudpod_offline_timeout (the config option exists, the task is
+      not yet specified) and computes is_online dynamically
+- [ ] Admin force-release endpoint (manual cleanup without agent tokens)
 - [ ] Rate limiting on the master
 - [ ] Audit log for all allocations/releases
 - [ ] CLI tool for admin operations (eab-manage)
@@ -2186,6 +2322,9 @@ curl -X POST https://eab-master:9533/v1/addresses/release \
       (e.g. for BGP controller integration)
 - [ ] IPv6 support
 - [ ] Quota management per CloudPod or project
+- [ ] Broker *all* allocations on managed external networks (not only
+      floating IPs) — removes the per-pod pool partitioning described in
+      Section 8.6
 
 ## 13. External NAT Realization (AWS-style)
 
