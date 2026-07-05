@@ -4,6 +4,13 @@ Design and implementation document for a Neutron IPAM plugin and an associated
 broker service that centrally manages floating IP addresses on external networks
 across multiple OpenStack CloudPods.
 
+> **Start here for implementation:** [CONCEPT.md](CONCEPT.md) consolidates this document and
+> [EXTERNAL-NAT-REALIZATION.md](EXTERNAL-NAT-REALIZATION.md) into a single blueprint — it
+> fixes the previously open design decisions, adds the missing pieces (brownfield adoption,
+> test strategy, API contract rules), and defines the milestone plan (M0–M5) for implementing
+> the distributed external network vision. This document remains the technical reference for
+> the EAB core components.
+
 ## 1. Problem Statement
 
 In a multi-CloudPod environment, multiple independent OpenStack control planes
