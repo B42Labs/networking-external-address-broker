@@ -692,6 +692,8 @@ stateless, so any number of instances can run in parallel.
 
 - Accepts reserve/release requests from the IPAM driver
 - Forwards these to the EAB master
+- Resolves `project_id → domain_id` via Keystone (TTL-cached) and adds it to
+  master reserve payloads for pool scope checks (README D11/D14)
 - Maintains a local cache of current allocations
 - Performs periodic sync reconciliation with the master
 - Reports its health status to the master
@@ -741,7 +743,8 @@ enabled = true
 
 [neutron]
 # Read-only Keystone credentials used by the reconcile loop to list the
-# floating IPs that exist locally in Neutron (see Section 7.3).
+# floating IPs that exist locally in Neutron (see Section 7.3), and to
+# resolve project -> domain for scoped pools (README D14).
 auth_url = https://keystone.cloudpod-a.example.com/v3
 username = eab-agent
 password = <secret>
@@ -1254,12 +1257,47 @@ class ManagedSubnet(Base):
     pool_start = Column(String(64), nullable=False)
     pool_end = Column(String(64), nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
+    # Pool tiers (README section 4.3, D11/D13):
+    access = Column(String(16), default='public',
+                    nullable=False)                  # 'public' | 'dedicated'
+    owner = Column(String(255), nullable=True)       # customer ref (informational)
+    prefix_origin = Column(String(16), default='operator',
+                           nullable=False)           # 'operator' | 'customer'
+    origin_asn = Column(Integer, nullable=True)      # BYOAS; NULL = operator ASN
+    nat_cluster = Column(String(64), nullable=True)  # Path B aggregate pinning
+    authz_state = Column(String(16), default='verified',
+                         nullable=False)  # customer prefixes start 'pending' (I7)
     created_at = Column(
         DateTime(timezone=True),
         default=lambda: datetime.datetime.now(tz=datetime.timezone.utc),
     )
 
     allocations = relationship('Allocation', back_populates='subnet')
+
+
+class SubnetScope(Base):
+    """Scope entry for a dedicated managed subnet (README D11).
+
+    Multiple rows for one subnet OR-combine: a requester matches if any
+    entry matches. Subnets with access='public' have no scope rows.
+    """
+    __tablename__ = 'subnet_scopes'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    managed_subnet_id = Column(
+        Integer, ForeignKey('managed_subnets.id'), nullable=False,
+    )
+    scope_type = Column(String(16), nullable=False)  # project|domain|cloudpod
+    scope_value = Column(String(64), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'managed_subnet_id', 'scope_type', 'scope_value',
+            name='uq_subnet_scope',
+        ),
+    )
+
+    managed_subnet = relationship('ManagedSubnet')
 
 
 class NetworkMapping(Base):
@@ -1353,6 +1391,11 @@ class Allocation(Base):
                         |  managed_subnet_id)|
                         +--------------------+
 ```
+
+> Not shown: the pool-tier columns on `ManagedSubnet` (`access`, `owner`, `prefix_origin`,
+> `origin_asn`, `nat_cluster`, `authz_state`) and the `SubnetScope` table
+> (`managed_subnet_id`, `scope_type`, `scope_value`; rows OR-combine) — see Section 6.3 and
+> README D11/D13.
 
 ### 6.5 Master API
 
@@ -1894,6 +1937,37 @@ def main():
     )
 ```
 
+### 6.7 Scoped Pools: Reserve-Path Changes (README D11/D12/D14)
+
+The code in Section 6.5 shows the unscoped baseline. With pool tiers (README §4.3) the
+reserve path changes in four places:
+
+1. **Mapping resolution becomes 1:N.** All `NetworkMapping` rows for
+   `(cloudpod_id, neutron_network_id)` are loaded — a shared external network may carry
+   several managed subnets (README §9.4, Model 2) — instead of `scalar_one_or_none()`.
+2. **Eligibility filter.** A managed subnet is eligible if `access = 'public'`, or if any
+   of its `SubnetScope` rows matches the request (`project` vs. `project_id`, `domain` vs.
+   `domain_id`, `cloudpod` vs. the token-derived pod). For dedicated pools `project_id` is
+   mandatory; a reserve without it fails 400.
+3. **Specific IP.** The containing subnet is located among the mapped subnets; if it is not
+   eligible for the requester, the master returns **403** (honest error by decision, README
+   D11) instead of 400/409.
+4. **Automatic allocation order (README D12).** An explicit `subnet_id` wins; otherwise
+   eligible dedicated pools are tried before public pools, tie-broken by pool id. Within a
+   pool the existing `_find_free_ip` + IntegrityError-retry loop (Section 8.3) is
+   unchanged.
+
+`domain_id` is resolved by the **agent** (not the IPAM driver) via its read-only Keystone
+credentials (Section 5.2) with a TTL cache and added to the master payload. If resolution
+fails while domain-scoped pools are among the candidates, the reserve fails 503 (fail
+closed, README D14).
+
+Additionally, `POST /v1/admin/subnets` validates CIDR **overlap** against all existing
+managed subnets (including IRIP pools): the unique constraint on `cidr` only rejects
+identical strings, which is insufficient once customers bring their own prefixes (README
+D13). `POST /v1/admin/mappings` rejects mappings that would attach a dedicated pool to a
+CloudPod outside its `cloudpod` scope.
+
 ## 7. Sequence Diagrams
 
 ### 7.1 Create Floating IP (automatic IP)
@@ -2280,6 +2354,11 @@ curl -X POST https://eab-master:9533/v1/addresses/release \
   each token is bound to exactly one CloudPod ID, and the master derives
   the acting CloudPod from the token — never from client-supplied headers
   or body fields
+- With dedicated pools (README D11), `project_id`/`domain_id` become
+  authorization-relevant inputs for pool scoping. Both are asserted by
+  operator-controlled infrastructure (neutron-server / the agent), which is
+  why trusting them is acceptable; the pod token still only binds the acting
+  CloudPod, and the scope check itself always runs in the master
 - Admin endpoints (/v1/admin/*) require a separate admin token
   (`[auth] admin_token`)
 
@@ -2330,6 +2409,8 @@ curl -X POST https://eab-master:9533/v1/addresses/release \
 - [ ] Broker *all* allocations on managed external networks (not only
       floating IPs) — removes the per-pod pool partitioning described in
       Section 8.6
+- [ ] Customer self-service for dedicated pool scopes and BYOIP/BYOAS
+      onboarding (admin-managed until then; see README §9.4/§9.5)
 
 ## 13. External NAT Realization (AWS-style)
 

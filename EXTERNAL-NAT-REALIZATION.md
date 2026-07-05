@@ -48,6 +48,8 @@ We replicate exactly this separation on OVN.
 | **IRIP** | *Internal Routable IP* — an address of the VM that is **unique and internally routable** within the operator's routing domain. Equivalent to the "ENI private IP" in AWS. |
 | **NAT layer** | External component (outside OpenStack) that statelessly 1:1-translates `FIP ↔ IRIP` and announces the FIP /32 to the internet. Equivalent to the AWS Internet Gateway. |
 | **Mapping record** | The record `FIP → IRIP` (+ tenant/port context). Lives in the EAB master. Equivalent to the AWS mapping-service entry. |
+| **BYOIP** | Customer-owned public prefix imported as a managed pool (README §4.3, Tier 3). Always realized via external NAT (README D13). |
+| **BYOAS** | Announcing a BYOIP prefix with the customer's ASN as BGP origin (mode B2, README D13). |
 
 ---
 
@@ -316,6 +318,9 @@ POST /v1/nat/bind     {floating_ip, fixed_ip, port_id, fip_id, cloudpod_id}
                          triggers export to NAT layer, returns {target_ip}
 POST /v1/nat/unbind   {floating_ip, cloudpod_id}  -> remove rule
 GET  /v1/nat/mappings -> all active FIP↔IRIP mappings (for reconcile/export)
+GET  /v1/nat/pools    -> external-nat pool metadata for the NAT controller:
+                         {cidr, origin_asn, announce_mode, nat_cluster, authz_state}
+                         (announcement templating, README D13)
 ```
 
 **Work items:**
@@ -325,6 +330,8 @@ GET  /v1/nat/mappings -> all active FIP↔IRIP mappings (for reconcile/export)
 - [ ] Idempotency + reconcile (mapping list as source of truth for the NAT layer).
 - [ ] Lifecycle edge cases: FIP re-association (port change ⇒ move/release the IRIP), IRIP
       release on unbind, one IRIP per port vs. one per FIP.
+- [ ] Export pool metadata (`/v1/nat/pools`) for announcement templating; omit pools with
+      `authz_state != verified` (README D13, I7).
 
 ### 6.3 EAB agent: export to the NAT layer
 
@@ -375,6 +382,33 @@ This requires the pool to be realized *exclusively* via external NAT: if OVN-nat
 share the same pool, their more-specific /32s must keep working, so mixed pools must stay on
 per-/32 announcements. Recommendation: use separate managed subnets per realization path.
 
+**BYOIP / BYOAS announcement (README D13).** Customer-owned prefixes are external-nat only,
+always use the aggregate model above, and take two parameters from the pool metadata
+(`/v1/nat/pools`): `nat_cluster` — the aggregate is announced from exactly one NAT cluster,
+the one that holds *all* of the pool's mappings — and `origin_asn`:
+
+- **Mode B1 (default):** the operator ASN originates the customer prefix; the customer's
+  RPKI ROA authorizes the operator ASN (the AWS BYOIP model). Nothing changes in FRR beyond
+  the additional `network` statement.
+- **Mode B2 (BYOAS):** the announcement carries the customer's ASN as BGP origin via a
+  per-pool route-map:
+
+```bash
+vtysh -c 'configure terminal' \
+      -c 'route-map byoas-cust1 permit 10' \
+      -c ' set as-path prepend 65010' \
+      -c 'router bgp 64500' \
+      -c 'address-family ipv4 unicast' \
+      -c 'network 203.0.113.0/24 route-map byoas-cust1'
+```
+
+The upstream sees the AS path `64500 65010` — the origin (rightmost AS) is the customer's
+65010 — and the ROA must authorize 65010. The heavier alternative is a per-customer VRF/BGP
+instance with `local-as`. Either way, mode B2 requires explicit upstream acceptance (IRR
+route object, as-path filters): an operator path ending in a foreign origin is otherwise
+indistinguishable from origin spoofing. The onboarding and offboarding checklist lives in
+README §9.5.
+
 Two limits of statelessness worth stating explicitly: (1) no port-overloading — each FIP
 consumes a full public IP (which is the AWS EIP model anyway); (2) the NAT layer cannot
 provide a shared N:1 SNAT for VMs *without* a FIP — those need a separate stateful egress
@@ -390,6 +424,8 @@ service, or deliberately get no internet access (see §10).
       covers it, and router-level SNAT only affects FIP-less VMs.
 - [ ] Announce the aggregate pool prefix from the NAT nodes where a pool is realized
       *exclusively* via external NAT (otherwise per-/32, see above).
+- [ ] Template the FRR origination per pool from `/v1/nat/pools` (origin-ASN modes B1/B2,
+      README D13); announce a pool's aggregate only from its pinned `nat_cluster`.
 
 ### 6.5 Internal routability of the IRIP (`ovn-network-agent`)
 
@@ -526,6 +562,8 @@ reconcile_interval = 30
 | **Security groups / conntrack** | Stateless 1:1 NAT has no own state; security groups remain effective in OVN at the VM port (IRIP side). Check inbound/outbound asymmetry. |
 | **IRIP attachment** | "OVN routes the IRIP to the VM" needs a concrete last-hop mechanism (§5.1). Option C (OVN translates IRIP ↔ fixed IP) is the pragmatic default; options A/B trade OVN purity against tenant addressing constraints or guest cooperation. |
 | **Egress for FIP-less VMs** | A stateless NAT layer cannot provide shared N:1 SNAT. VMs without a FIP behind an `external-nat` router need a separate stateful egress service — or deliberately get no internet access. |
+| **BYOAS upstream acceptance** | Mode B2 (customer origin ASN) needs explicit upstream coordination (IRR route objects, as-path filters, RPKI ROA for the customer ASN). Default is mode B1 — operator origin, customer ROA authorizes the operator ASN (README D13, §9.5). |
+| **Aggregate vs. multiple NAT clusters** | An aggregate announced from a cluster that lacks the pool's mappings blackholes traffic. Pools are pinned to one `nat_cluster`; the NAT controller announces only pools listed for it in `/v1/nat/pools` (README D13). |
 | **MTU** | No extra header with pure NAT (no overlay overhead) — an advantage over the encap variant. |
 
 ---
@@ -539,6 +577,8 @@ reconcile_interval = 30
 **New / changed:**
 - New **L3 flavor driver** (`external-nat`) — suppresses OVN NAT, exports the mapping.
 - **Master data model** extended with mapping + IRIP pool; new `/v1/nat/*` endpoints.
+- **Pool metadata export** (`/v1/nat/pools`: origin ASN, announce mode, NAT cluster) for
+  dedicated/BYOIP pools (README D13).
 - **External NAT layer** as a new data-path component (outside OpenStack).
 - **`ovn-network-agent`**: no longer announces a public /32 for these FIPs, instead the internal IRIP.
 

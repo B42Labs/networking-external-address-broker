@@ -30,6 +30,9 @@ One operator-wide public address space, consumed by many autonomous OpenStack co
 - **The public IP is a pure control-plane object.** It can be created, bound, unbound and —
   in the target picture — moved between workloads (and eventually between pods) without
   renumbering anything.
+- **Not all public space is anonymous.** A range can be dedicated to one customer — usable
+  only in specific domains, projects, or CloudPods — and customers can bring their own
+  prefix and origin ASN (BYOIP/BYOAS, §4.3).
 
 The architecture separates four concerns; keeping them independent is what makes the
 distribution work:
@@ -82,6 +85,8 @@ distribution work:
 - Packaging and deployment reference (§8).
 - Explicit system invariants any implementation must maintain (§4.2).
 - Cross-pod FIP mobility named as the long-term target the design must not preclude (§12).
+- Pool tiers: dedicated (customer-scoped) public pools and BYOIP/BYOAS (§4.3, D11–D14,
+  §9.4–9.5).
 
 ## 4. Consolidated Target Architecture
 
@@ -140,6 +145,29 @@ Every milestone's acceptance tests assert these; any implementation change must 
   and reconcile toward the master (R§7.3, X§6.3). Repair always flows master → edge.
 - **I5 — Control plane failures never touch realized traffic.** Master or agent outages block
   *new* allocations/bindings only; existing NAT entries, rules, and BGP announcements stay up.
+- **I6 — Scope enforcement.** An address from a `dedicated` pool is never allocated to a
+  project, domain, or CloudPod outside the pool's scope. Enforced in the master's reserve
+  path (D11) — Neutron RBAC only shapes visibility and is never the enforcement point.
+- **I7 — Authorized announcement only.** A customer-owned prefix (BYOIP) is never exported
+  to the NAT layer or announced before its authorization evidence is verified
+  (`authz_state = verified`, §9.5). Enforced structurally: the exporter omits unverified
+  pools (D13).
+
+### 4.3 Address pool tiers
+
+Managed public pools come in three tiers; higher tiers add properties, while the allocation
+machinery (I1, D7) is identical for all of them.
+
+| Tier | Prefix owned by | Who may allocate | Origin ASN | Realization |
+|---|---|---|---|---|
+| **1 — public** | operator | every project | operator | Path A or B (D6) |
+| **2 — dedicated** | operator | pool scope only (D11) | operator | Path A or B (D6) |
+| **3 — BYOIP** | customer | pool scope only (implied) | operator (**B1**, default) or customer ASN (**B2**/BYOAS) | Path B only (D13) |
+
+Tier 2 realizes "private" public addresses: a public range reserved for one customer,
+usable only in specific domains, projects, or CloudPods. Tier 3 additionally imports a
+customer-owned prefix — optionally announced with the customer's origin ASN — and implies a
+dedicated scope; it builds entirely on Tier 2 machinery plus the D13 announcement rules.
 
 ## 5. Design Decisions
 
@@ -232,6 +260,56 @@ master would let the master hand out already-used addresses to other pods. The i
 procedure (§9) is therefore a **mandatory** step in the enablement runbook, and `eab-manage
 import` is a deliverable (M3).
 
+### D11 — Pool scoping is enforced in the master
+Each public `ManagedSubnet` carries `access ∈ {public, dedicated}`; `dedicated` pools own a
+set of scope entries (`SubnetScope`: project, domain, or CloudPod — multiple entries
+OR-combine). The master's reserve path filters candidate pools by scope and rejects
+out-of-scope requests — including specific-IP requests — with **403**. An honest error is
+chosen over masking; that this reveals the existence of a reserved range is accepted for an
+operator-run platform. *Why:* Neutron RBAC (`access_as_external`) shapes what tenants see,
+but a mis-configured RBAC rule or network mapping must not hand out customer addresses —
+scope enforcement is central, like I1 (⇒ I6). Consequences: `NetworkMapping` resolution
+becomes 1:N (one Neutron network may map to several managed subnets, §9.4 Model 2);
+`project_id` turns from informational into authorization-relevant and is mandatory for
+dedicated pools; pool creation validates CIDR *overlap* against all managed subnets (a
+unique CIDR is not enough once customers bring prefixes); and `POST /v1/admin/mappings`
+rejects mappings that would attach a dedicated pool to a CloudPod outside its `cloudpod`
+scope.
+
+### D12 — Deterministic pool selection
+For a reserve without a specific IP or subnet: an explicitly requested `subnet_id` always
+wins; otherwise the master picks from *eligible* pools — dedicated pools (in scope for the
+requesting project/domain) before `public` pools, tie-broken by pool id. *Why:* a customer
+with a dedicated range expects to land in it by default, and the fixed order makes
+allocation behavior reproducible. Consequence: a scoped customer who wants a generic public
+IP must request the public subnet explicitly — documented UX trade-off (§9.4).
+
+### D13 — BYOIP/BYOAS pools are Path B only, announced from one NAT cluster
+Pools with `prefix_origin = customer` or a non-NULL `origin_asn` must have
+`realization = external-nat`; the master rejects other combinations (validation analogous
+to D6). The pool aggregate is announced from exactly **one** NAT cluster, pinned via
+`nat_cluster`. Two announcement modes: **B1** (default) — the operator ASN originates the
+customer prefix and the customer's RPKI ROA authorizes the operator ASN (the AWS BYOIP
+model); **B2** (opt-in, BYOAS) — the NAT nodes originate with the customer ASN as BGP
+origin (per-pool route-map `set as-path prepend <customer-asn>`, or a per-customer
+VRF/`local-as` instance), the ROA authorizes the customer ASN, and the upstream must
+explicitly accept the path (IRR/filters, §9.5). *Why:* Path A would replicate per-prefix
+origin policy onto every network node with per-/32 churn; Path B centralizes BGP policy on
+few NAT nodes and already announces aggregates for exclusive pools (D6/D9). Consequence:
+the exporter contract gains pool metadata (`GET /v1/nat/pools`, §6.3), and BYO onboarding
+becomes a gated runbook step (§9.5, I7).
+
+### D14 — Domain resolution in the agent, fail closed
+Scope checks need the requesting project's domain, which Neutron's IPAM path does not
+carry. The agent resolves `project_id → domain_id` via its existing read-only Keystone
+credentials (R§5.2 `[neutron]`) with a TTL cache and passes `domain_id` in the master
+reserve payload. If Keystone is unreachable and the candidate set contains domain-scoped
+pools, the reserve fails 503 (fail closed, in the spirit of D1). *Why:* the IPAM driver
+must stay lightweight inside neutron-server, and the agent already holds Keystone
+credentials. Consequence: Keystone becomes a soft dependency of the allocation path — for
+domain-scoped pools only, cushioned by the cache, and irrelevant for project-/pod-scoped or
+public pools.
+
 ## 6. Interface Contracts
 
 ### 6.1 API surface and versioning
@@ -252,19 +330,24 @@ Consolidated endpoint inventory (existing = R§5.3/R§6.5, X = X§6.2, new = thi
 | `POST /v1/cloudpods/heartbeat`, `GET /v1/cloudpods` | R§6.5 | M1 |
 | `POST /v1/admin/{subnets,cloudpods,mappings}` + `GET` variants | R§6.5 | M1 |
 | `POST /v1/admin/addresses/force-release` | **new (R§12.2 item)** | M1 |
+| `POST /v1/admin/subnets/{id}/scopes` + `GET`/`DELETE` variants | **new (D11)** | M1 |
 | `GET /v1/health` (master and agent) | R§5.3/R§6.5 | M1/M2 |
 | Agent: `POST /v1/addresses/{reserve,release}` | R§5.3 | M2 |
 | Agent: `POST /v1/nat/{bind,unbind}` (local, from L3 driver) | X§6.3 | M4 |
 | `POST /v1/nat/bind`, `POST /v1/nat/unbind`, `GET /v1/nat/mappings` | X§6.2 | M4 |
+| `GET /v1/nat/pools` | **new (D13)** | M4 |
 
 Error model (uniform): `400` invalid input (e.g. IP outside managed pool), `401`
-unauthenticated, `403` token/CloudPod mismatch, `404` unknown mapping/allocation, `409`
-conflict (already allocated / pool exhausted), `503` upstream authority unreachable.
+unauthenticated, `403` token/CloudPod mismatch or pool-scope violation (D11), `404` unknown
+mapping/allocation, `409` conflict (already allocated / pool exhausted), `503` upstream
+authority unreachable.
 
-### 6.2 Reserve/confirm additions (D7)
+### 6.2 Reserve/confirm additions (D7, D11, D14)
 
-`reserve` request gains an optional `idempotency_key` (string, unique per reservation);
-response is unchanged. New endpoint:
+`reserve` request gains an optional `idempotency_key` (string, unique per reservation, D7)
+and an optional `domain_id` (resolved and supplied by the agent, D14; used by the master
+only for scope filtering, D11); response is unchanged. Scope violations — including
+specific-IP requests into an out-of-scope dedicated pool — return `403`. New endpoint:
 
 ```
 POST /v1/addresses/confirm
@@ -282,6 +365,10 @@ The exporter delivers **desired state**, not events:
   `{fip, irip, state, version}` for the affected FIP.
 - Periodic full document: the complete active mapping list (equivalent to
   `GET /v1/nat/mappings`).
+- Pool metadata (`GET /v1/nat/pools`, D13): one record per `external-nat` pool —
+  `{cidr, origin_asn, announce_mode, nat_cluster, authz_state}`. The NAT controller derives
+  its FRR origination (aggregate + origin ASN) from this document, never from mapping
+  records; pools with `authz_state ≠ verified` are omitted (I7).
 
 The NAT controller must be idempotent: applying the same record twice is a no-op; applying a
 record replaces the FIP's rules in one atomic nft transaction (D8); a FIP absent from a full
@@ -298,6 +385,18 @@ ManagedSubnet            (R§6.3, extended)
   + kind          : 'public' | 'internal'        # 'internal' = IRIP pool (replaces the
                                                  #  config-only irip_pool_cidr from X§9)
   + realization   : 'ovn' | 'external-nat'       # public pools only; enforces D6
+  + access        : 'public' | 'dedicated'       # D11 (public pools only)
+  + owner         : string, nullable             # customer reference, informational (D11)
+  + prefix_origin : 'operator' | 'customer'      # D13 (BYOIP)
+  + origin_asn    : int, nullable                # D13 (BYOAS; NULL = operator ASN)
+  + nat_cluster   : string, nullable             # D13 (Path B aggregate pinning)
+  + authz_state   : 'pending' | 'verified'       # I7 (customer prefixes start pending)
+
+SubnetScope              (new, D11)
+  managed_subnet_id : FK → ManagedSubnet
+  scope_type        : 'project' | 'domain' | 'cloudpod'
+  scope_value       : string
+  # UNIQUE(managed_subnet_id, scope_type, scope_value); rows OR-combine
 
 Allocation               (R§6.3 + X§6.2, extended)
   + state             : 'pending' | 'active'     # D7
@@ -313,6 +412,12 @@ InternalAddress          (X§6.2, refined)
 Rationale for the `kind` unification: IRIP allocation then reuses the exact allocation
 machinery (pool iteration, unique constraint, race retry, R§8.3) instead of a parallel
 implementation.
+
+Two reserve-path consequences of D11: the `(cloudpod_id, neutron_network_id)` mapping
+lookup returns a *list* of managed subnets (§9.4 Model 2 puts several pools behind one
+shared network), and `POST /v1/admin/subnets` validates CIDR **overlap** against all
+existing managed subnets including IRIP pools — the unique constraint on `cidr` only
+rejects identical strings, which is insufficient once customers bring their own prefixes.
 
 Schema management: Alembic migrations from the first migration onward;
 `Base.metadata.create_all` remains a dev-only bootstrap (as already noted in R§6.6).
@@ -359,6 +464,50 @@ Extends R§8.5: mark the pod offline, confirm BGP withdrawal of all its /32s (an
 `external-nat` mappings still target IRIPs in that pod), then force-release its allocations
 via the admin endpoint (M1) — never automatically.
 
+### 9.4 Provisioning dedicated pools (D11, D12)
+
+Two Neutron-side models; both map onto a `dedicated` ManagedSubnet with scope entries:
+
+1. **Dedicated external network per customer (recommended).** In every CloudPod within the
+   pool's scope, create a separate external network + subnet for the customer range, make
+   it visible via Neutron RBAC (`openstack network rbac create --action access_as_external
+   --target-project ...`), and map it onto the dedicated ManagedSubnet. The range's
+   existence is not leaked to other tenants, and specific-IP requests from other networks
+   already fail the pool-membership check (400).
+2. **Additional subnet on the shared external network.** No network proliferation, but
+   every tenant of the shared network can see the subnet (Neutron cannot hide subnets per
+   project) and scope enforcement rests entirely on the master (403, I6). Requires the 1:N
+   mapping resolution (D11). Use when a network per customer is a concern.
+
+In both models the R§8.6 rule applies: local (non-FIP) allocation pools must not overlap
+dedicated ranges. In Model 1 the customer's own gateway ports consume the customer range —
+correct, but size the pool for it; in Model 2 keep dedicated subnets out of the shared
+network's local allocation pools entirely.
+
+Scopes are **admin-managed** (`/v1/admin/subnets/{id}/scopes`, `eab-manage`); customer
+self-service is future evolution (§12).
+
+### 9.5 BYOIP / BYOAS onboarding (D13, I7)
+
+Per customer prefix, before the pool may become `authz_state = verified`:
+
+1. **Authorization evidence:** LOA from the prefix holder; IRR `route:` object for the
+   prefix with the intended origin ASN; RPKI ROA — authorizing the **operator ASN** (mode
+   B1, default) or the **customer ASN** (mode B2).
+2. **Upstream coordination:** prefix filters and (B2) as-path filters updated; max-prefix
+   budgets checked. B2 must be explicitly accepted by the upstream — an operator-AS path
+   ending in a foreign origin is otherwise indistinguishable from origin spoofing.
+3. **Master provisioning:** create the ManagedSubnet (`kind=public`,
+   `realization=external-nat`, `prefix_origin=customer`, `access=dedicated`, scope entries,
+   `origin_asn` for B2, `nat_cluster`); CIDR-overlap validation runs here (D11).
+4. **Verification:** looking-glass check — aggregate visible with the expected origin ASN,
+   RPKI state `valid` — then set `authz_state=verified`. Before that, the exporter never
+   ships the pool (I7).
+
+**Offboarding** reverses the order: drain/release all allocations, withdraw the aggregate
+(remove the pool from the export), remove upstream filters and ROA/IRR entries, delete the
+pool.
+
 ## 10. Test and Verification Strategy
 
 | Level | Setup | What it proves |
@@ -366,9 +515,10 @@ via the admin endpoint (M1) — never automatically.
 | **Unit** (tox, every PR) | none | Factory routing logic (device_owner / external-network checks, R§4.6); allocation race retry; lease reaper; IRIP allocator; exporter idempotency. |
 | **Contract** (every PR) | master + Postgres in containers | Real `AgentClient`/`MasterClient` against a live master; OpenAPI conformance; error-model table (§6.1). |
 | **Functional race storm** (every PR) | master + Postgres + 2 simulated agents (docker-compose) | **I1**: N parallel reserves from 2 pods ⇒ zero duplicates; pool exhausts at exactly pool-size allocations; lease expiry releases unconfirmed reservations. |
+| **Scope enforcement** (every PR) | master + Postgres in containers | **I6**: out-of-scope reserve and specific-IP requests ⇒ 403; selection order per D12; CIDR-overlap rejection at pool creation; domain-resolution failure with domain-scoped candidates ⇒ fail closed (D14). |
 | **Single-pod integration** (gate) | one devstack/kolla-AIO with driver enabled | FIP CRUD via broker; specific-IP requests; induced port-create failure (quota) ⇒ reservation auto-released within lease TTL; agent down ⇒ FIP create fails 503 (**I3**). |
 | **Multi-pod e2e** (periodic) | 2 AIO pods + 1 master | Concurrent FIP create/delete loops across pods ⇒ **I1** holds; kill master mid-storm ⇒ both pods fail closed, existing FIPs keep passing traffic (**I5**), no duplicates after recovery; brownfield import scenario (§9.1) incl. seeded duplicate detection. |
-| **Path B data path** (lab, then periodic) | X§8 Phase 0 lab: NAT nodes + FRR + one pod | `ovn-nbctl lr-nat-list` shows no public FIP for `external-nat` routers; inbound/outbound flows per X§7; ECMP asymmetry (two NAT nodes, directions forced onto different nodes — must work statelessly); drift injection (delete an nft rule ⇒ reconcile restores it within `reconcile_interval`); NAT node failure ⇒ flows unaffected. |
+| **Path B data path** (lab, then periodic) | X§8 Phase 0 lab: NAT nodes + FRR + one pod | `ovn-nbctl lr-nat-list` shows no public FIP for `external-nat` routers; inbound/outbound flows per X§7; ECMP asymmetry (two NAT nodes, directions forced onto different nodes — must work statelessly); drift injection (delete an nft rule ⇒ reconcile restores it within `reconcile_interval`); NAT node failure ⇒ flows unaffected; BYO pool aggregate carries the expected origin ASN (B1/B2) and is announced only from the pinned NAT cluster (D13). |
 | **Failure drills** | staging | Walk R§8.1–8.6 as an operator checklist per release. |
 
 ## 11. Implementation Roadmap
@@ -390,20 +540,27 @@ IPs with today's OVN realization — even if Path B were never built.
 *Acceptance:* CI green on the empty skeleton; S1 report merged.
 
 ### M1 — EAB master
-- Data model §7 (incl. D7 columns, `kind`/`realization`); Alembic migration 001.
+- Data model §7 (incl. D7 columns, `kind`/`realization`, the D11/D13 pool-tier columns and
+  `SubnetScope`); Alembic migration 001.
 - API per §6.1 (M1 rows): reserve (with idempotency), release, **confirm**, list, heartbeat,
-  admin CRUD, **admin force-release**.
+  admin CRUD (incl. **scope CRUD**, D11), **admin force-release**.
+- Scoped reserve path (D11/D12): 1:N mapping resolution, eligibility filter + 403,
+  deterministic pool selection, CIDR-overlap validation at pool creation, mapping
+  validation against `cloudpod` scopes.
 - Background tasks: lease reaper (D7), CloudPod offline marking
   (`cloudpod_offline_timeout`, R§12.2).
 - Prometheus metrics endpoint; audit log of every reserve/confirm/release with acting pod.
 
-*Acceptance:* race-storm suite green (I1); reaper test green; OpenAPI artifact published.
+*Acceptance:* race-storm suite green (I1); scope-enforcement suite green (I6); reaper test
+green; OpenAPI artifact published.
 
 ### M2 — Agent + IPAM driver (single pod, Path A complete)
 - Agent per R§5 (app, master client, cache, sync incl. pending-confirmation logic per D7).
 - IPAM driver + `AddressRequestFactory` per R§4; `AFTER_DELETE` callback (R§4.7) plus the new
   `AFTER_CREATE` confirm callback (D7); callback import wiring per R§4.8.
 - Verify idempotency-key availability (FIP port ID at `get_request` time) — adjust D7 note.
+- Agent-side domain resolution (D14): `project_id → domain_id` via the existing read-only
+  Keystone credentials, TTL cache, fail closed; `domain_id` added to the master payload.
 
 *Acceptance:* single-pod integration suite green (incl. fail-closed and leak-cleanup tests,
 §10); a FIP allocated via broker is realized in OVN and announced by `ovn-network-agent`
@@ -414,6 +571,8 @@ exactly as before (Path A regression-free).
 - `eab-manage` CLI: `import` (§9.1), `force-release`, `report` (allocation/discrepancy
   overview).
 - Brownfield runbook (§9.1) validated against a pod with pre-existing FIPs.
+- `eab-manage import` respects pool scopes (imported FIPs violating a scope are reported as
+  conflicts); dedicated-pool provisioning runbook (§9.4) validated.
 - Rate limiting on the master; dashboards for the R§10.1 metrics.
 
 *Acceptance:* multi-pod chaos suite green incl. master-outage scenario (I3/I5); import of a
@@ -429,10 +588,14 @@ pod with seeded duplicates produces the expected conflict report.
   + FRR; aggregate announcement for exclusive pools (D9).
 - `ovn-network-agent` (separate repo, coordinated release): IRIP /32 announcement into the
   fabric, keyed off NAT rows whose `external_ip` is an IRIP (X§6.5–6.6).
+- Pool metadata export (`GET /v1/nat/pools`) + NAT-controller FRR origination templating
+  per pool: origin-ASN modes B1/B2, aggregate pinned to `nat_cluster` (D13); BYOIP/BYOAS
+  onboarding runbook (§9.5) validated in the lab, incl. the I7 gating.
 
 *Acceptance:* X§7 flows demonstrated end-to-end on the lab; Path B suite (§10) green incl.
 ECMP asymmetry, drift repair, and no-public-FIP-in-OVN check; FIP re-association swaps IRIP
-without traffic to other FIPs being touched (D8).
+without traffic to other FIPs being touched (D8); a BYO pool is announced with its
+configured origin ASN and RPKI-validates in the lab (D13).
 
 ### M5 — Scale-out and evolution
 - HA validation (master replicas + Patroni failover drill, D2).
@@ -453,6 +616,7 @@ without traffic to other FIPs being touched (D8).
 | Realization per router | D3, D4, D6 | M4 (gated by S1) |
 | IP as pure control-plane object | D5, D8 | M4 |
 | Moves without renumbering | (§12, out of scope) | future |
+| "Private" public addresses + BYOIP/BYOAS (§4.3) | D11–D14 | M1–M3 (scoping), M4 (BYO) |
 
 ## 12. Future Evolution (explicitly out of scope, must not be precluded)
 
@@ -462,6 +626,9 @@ without traffic to other FIPs being touched (D8).
   a master-side "allocation transfer" operation; nothing in the current design blocks it.
 - **Overlapping tenant CIDRs without IRIPs:** per-tenant encapsulation / EVPN Type-5 at the
   NAT layer (X§5, X§10).
+- **Customer self-service for dedicated pools:** tenants managing their own pool scopes and
+  BYO onboarding status behind a customer-facing auth model (Keystone). Deliberately
+  admin-managed until then (D11, §9.4).
 - **Keystone-based authentication** between agents and master (R§11.2, R§12.3).
 - **Hierarchical / multi-region brokers** if a single master domain becomes too large.
 
@@ -479,3 +646,8 @@ without traffic to other FIPs being touched (D8).
 | 8 | Stateless NAT ⇒ no shared N:1 SNAT for FIP-less VMs behind `external-nat` routers | Feature gap | Documented constraint (X§10); separate stateful egress service if needed | docs |
 | 9 | Security-group/conntrack asymmetry with stateless NAT + ECMP | Dropped flows | Explicit ECMP-asymmetry test; SGs enforced at the VM port on the IRIP side (X§10) | M4 |
 | 10 | Non-FIP ports (router gateways) collide across pods | Routing conflict | R§8.6 disjoint-pool operating rule until M5 "broker all allocations" | M3 docs, M5 |
+| 11 | Mis-created mapping or RBAC rule exposes a dedicated pool to foreign tenants | Customer-IP leakage | I6 master-side scope enforcement; mapping creation validated against `cloudpod` scopes (D11) | M1 |
+| 12 | Keystone dependency in the allocation path (domain-scoped pools) | FIP-create latency/outage | TTL cache; fail closed only when domain-scoped pools are candidates (D14) | M2 |
+| 13 | Upstream rejects customer-origin announcements (B2) | BYOAS pool unusable | B1 (operator origin) as default; B2 opt-in with §9.5 coordination checklist | M4, docs |
+| 14 | BYOIP prefix overlaps an existing managed pool or IRIP pool | Broken routing/allocation | CIDR-overlap validation at pool creation (D11) | M1 |
+| 15 | Pool aggregate announced from a NAT cluster without the pool's mappings | Blackholed FIPs | `nat_cluster` pinning; announcement follows pool metadata only (D13) | M4 |
