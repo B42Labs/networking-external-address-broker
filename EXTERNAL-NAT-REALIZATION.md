@@ -1,7 +1,8 @@
 # External NAT Realization — Placing Floating IPs Outside of OVN
 
 > **Status:** Design / Draft
-> **Scope:** Extension to the existing EAB architecture (see [README.md](README.md)).
+> **Scope:** Extension to the existing EAB architecture (see
+> [EAB-CORE-DESIGN.md](EAB-CORE-DESIGN.md)).
 > Describes how a floating IP is **allocated via Neutron** but the actual **NAT is
 > realized outside of OpenStack/OVN** — analogous to AWS Elastic IPs.
 
@@ -335,7 +336,7 @@ reconcile against `/v1/nat/mappings`.
 
 **Work items:**
 - [ ] `AgentClient.bind_nat/unbind_nat` (local path L3 driver → agent).
-- [ ] Master-side exporter (webhook/gRPC/Netconf depending on the NAT layer) — cf. README §12.3 "Webhook notifications".
+- [ ] Master-side exporter (webhook/gRPC/Netconf depending on the NAT layer) — cf. EAB-CORE-DESIGN.md §12.3 "Webhook notifications".
 - [ ] Reconcile loop: mapping list ↔ actual state of the NAT layer.
 
 ### 6.4 External NAT layer (reference implementation)

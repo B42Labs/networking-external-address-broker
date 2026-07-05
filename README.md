@@ -1,2378 +1,481 @@
 # networking-external-address-broker
 
-Design and implementation document for a Neutron IPAM plugin and an associated
-broker service that centrally manages floating IP addresses on external networks
-across multiple OpenStack CloudPods.
+Distributed external networks on OpenStack — consolidated concept and implementation
+blueprint for a Neutron IPAM plugin, a central address broker (EAB), and pluggable
+floating IP realization paths across multiple OpenStack CloudPods.
 
-> **Start here for implementation:** [CONCEPT.md](CONCEPT.md) consolidates this document and
-> [EXTERNAL-NAT-REALIZATION.md](EXTERNAL-NAT-REALIZATION.md) into a single blueprint — it
-> fixes the previously open design decisions, adds the missing pieces (brownfield adoption,
-> test strategy, API contract rules), and defines the milestone plan (M0–M5) for implementing
-> the distributed external network vision. This document remains the technical reference for
-> the EAB core components.
+> **Status:** Concept / basis for implementation.
+> **Purpose:** Consolidates [EAB-CORE-DESIGN.md](EAB-CORE-DESIGN.md) (EAB core) and
+> [EXTERNAL-NAT-REALIZATION.md](EXTERNAL-NAT-REALIZATION.md) (external NAT path) into one
+> implementable blueprint. Where those documents leave a decision open, **this document fixes
+> it**; for everything already specified there, this document references instead of repeating.
+>
+> Reference notation: `R§n` = EAB-CORE-DESIGN.md section n, `X§n` =
+> EXTERNAL-NAT-REALIZATION.md section n.
 
-## 1. Problem Statement
+---
 
-In a multi-CloudPod environment, multiple independent OpenStack control planes
-share the same public IP network (e.g. 198.51.100.0/24). Each CloudPod has its
-own external network with identical subnets. Without central coordination, the
-same floating IP can be assigned in multiple CloudPods simultaneously.
+## 1. The Vision
 
-Each assigned floating IP is announced by the respective CloudPod as a /32 route
-via BGP. Duplicate assignments lead to routing conflicts.
+One operator-wide public address space, consumed by many autonomous OpenStack control planes
+(CloudPods) as if they were a single cloud:
 
-## 2. Target Architecture
+- **Any public IP can be used in any CloudPod — exactly once.** Allocation is conflict-free
+  across all pods, enforced centrally.
+- **Traffic finds the IP wherever it is realized.** Routing follows allocation via BGP; no
+  static partitioning of the address space per pod is required for floating IPs.
+- **Realization is a property of a router, not of the cloud.** The same allocated IP can be
+  realized OVN-natively (`dnat_and_snat`) or by an external NAT layer (AWS-style), selected
+  per router via an L3 flavor.
+- **The public IP is a pure control-plane object.** It can be created, bound, unbound and —
+  in the target picture — moved between workloads (and eventually between pods) without
+  renumbering anything.
 
-```
-                        +-----------------------+
-                        |   EAB Master          |
-                        |   (central DB)        |
-                        |                       |
-                        |  Source of truth      |
-                        |  for all IP           |
-                        |  allocations          |
-                        +--+--------+--------+--+
-                           |        |        |
-              +------------+        |        +--------------+
-              |                     |                       |
-     +--------v----------+  +-------v-----------+  +--------v----------+
-     |  EAB Agent        |  |  EAB Agent        |  |  EAB Agent        |
-     |  CloudPod A       |  |  CloudPod B       |  |  CloudPod C       |
-     |                   |  |                   |  |                   |
-     |  local cache      |  |  local cache      |  |  local cache      |
-     +--------^----------+  +-------^-----------+  +--------^----------+
-              |                     |                       |
-     +--------+----------+  +-------+-----------+  +--------+----------+
-     |  Neutron          |  |  Neutron          |  |  Neutron          |
-     |  IPAM Driver      |  |  IPAM Driver      |  |  IPAM Driver      |
-     |  (plugin)         |  |  (plugin)         |  |  (plugin)         |
-     +-------------------+  +-------------------+  +-------------------+
-```
+The architecture separates four concerns; keeping them independent is what makes the
+distribution work:
 
-Components:
-
-- **EAB Master**: Central service. Maintains the authoritative database of all
-  IP allocations. Runs once for the entire environment.
-- **EAB Agent**: Local service per CloudPod. Communicates with the master and
-  provides a local API for the Neutron IPAM driver. Maintains a local cache
-  of the allocation state.
-- **IPAM Driver**: Neutron plugin (out-of-tree). For floating IP allocations
-  on external networks, the local EAB agent is contacted. All other
-  allocations are delegated to the standard IPAM driver (NeutronDbPool).
-
-## 3. Network-Side Counterpart: ovn-network-agent
-
-> This section describes the **default, OVN-native** floating IP realization. An alternative
-> model that realizes the NAT *outside* of OVN is described in
-> [Section 13](#13-external-nat-realization-aws-style); the two are alternatives selected per
-> router, and the agent is needed in both (see [Section 3.4](#34-two-realization-paths-one-agent)).
-
-The External Address Broker ensures that floating IPs are uniquely allocated
-across all CloudPods. However, once an IP is allocated, it still needs to be
-reachable from outside — this is where the
-[ovn-network-agent](https://github.com/osism/ovn-route-agent) (formerly `ovn-route-agent`)
-comes in.
-
-The `ovn-network-agent` is an event-driven daemon that runs on the **Network Nodes**
-(gateway chassis) of each CloudPod. It watches the OVN Southbound and Northbound
-databases in real time via the OVSDB protocol and synchronizes the routing state
-for floating IPs into the local network stack.
-
-### 3.1 What it does
-
-When a floating IP is assigned (via Neutron / the EAB), the ovn-network-agent
-detects the corresponding NAT entry in OVN and:
-
-1. **Creates a /32 host route** in the kernel for the floating IP
-2. **Announces the /32 route via BGP** through FRR, so that upstream routers
-   know which Network Node handles traffic for that specific IP
-3. **Installs OVS flows** on the provider bridge (typically `br-ex`) to ensure
-   proper packet handling (MAC-tweak flows for correct L2 acceptance)
-4. **Manages VRF route leaking** via automatically-created veth pairs to connect
-   the default and provider VRFs, enabling policy-based routing for return traffic
-
-When a floating IP is removed, the agent cleans up all of these resources.
-
-### 3.2 Why this matters for the EAB
-
-In a multi-CloudPod setup, the combination of both components ensures
-conflict-free routing:
-
-```
-                         ┌───────────────────────┐
-                         │   Upstream Router     │
-                         │   (receives BGP)      │
-                         └───────┬──────┬────────┘
-                                 │      │
-               /32 route to A ───┘      └─── /32 route to B
-                                 │      │
-              ┌──────────────────┘      └──────────────────┐
-              │                                            │
-   ┌──────────▼───────────┐                 ┌──────────────▼──────────┐
-   │  Network Node        │                 │  Network Node           │
-   │  CloudPod A          │                 │  CloudPod B             │
-   │                      │                 │                         │
-   │  ovn-network-agent   │                 │  ovn-network-agent      │
-   │  announces:          │                 │  announces:             │
-   │    198.51.100.42/32  │                 │    198.51.100.43/32     │
-   │    198.51.100.50/32  │                 │    198.51.100.51/32     │
-   └──────────────────────┘                 └─────────────────────────┘
-```
-
-- The **EAB** guarantees that `.42` is only ever allocated in CloudPod A and
-  `.43` only in CloudPod B — no duplicates across CloudPods.
-- The **ovn-network-agent** ensures that only the Network Node holding the
-  respective floating IP announces its /32 route via BGP — no conflicting
-  routes from different chassis.
-
-Without the ovn-network-agent, the /32 routes would not be announced and external
-traffic would have no path to reach the floating IPs. Without the EAB, two
-CloudPods could allocate the same IP and both announce conflicting /32 routes.
-
-### 3.3 Prerequisites
-
-The ovn-network-agent requires:
-
-- TCP access to the OVN Southbound and Northbound databases
-- FRR with `vtysh` available for BGP route injection
-- An existing provider bridge (typically `br-ex`)
-- Root or `CAP_NET_ADMIN` capabilities
-
-For installation and configuration details, see the
-[ovn-network-agent repository](https://github.com/osism/ovn-route-agent).
-
-### 3.4 Two realization paths, one agent
-
-This section describes the **default, OVN-native** realization: the floating IP becomes a
-`dnat_and_snat` entry in OVN and the `ovn-network-agent` announces the **public FIP /32**.
-[Section 13](#13-external-nat-realization-aws-style) describes an **alternative** in which the
-NAT is applied outside of OVN and no OVN NAT entry is created.
-
-The two paths are **alternatives selected per router** (via an L3 flavor), **not** a
-replacement of one by the other. The `ovn-network-agent` is required in **both** — only its job
-changes:
-
-| | Default (OVN-native, this section) | External NAT (Section 13) |
+| Layer | Question it answers | Owner |
 |---|---|---|
-| NAT location | OVN `dnat_and_snat` | external NAT layer |
-| What the agent announces | the public **FIP** /32 | the internal **IRIP** /32 |
-| Where it announces | toward the upstream / internet | toward the DC fabric (internal) |
-| Agent trigger | the OVN **NAT entry** | the VM **port / IRIP binding** |
+| **Allocation** | Who owns the address? | EAB master (single source of truth) |
+| **Association** | Which workload does it map to? | Neutron `floatingip` API (per pod, unchanged UX) |
+| **Realization** | Where are packets translated? | OVN `dnat_and_snat` **or** external NAT layer |
+| **Announcement** | How does the internet find it? | BGP: `ovn-network-agent` (/32) or NAT layer (/32 or aggregate) |
 
-For OVN-flavor routers the agent announces FIPs (as today); for `external-nat`-flavor routers it
-announces IRIPs and never the FIP. The EAB allocation core (Sections 4–6) is unchanged and
-required on both paths.
+## 2. Document Map
 
-## 4. Component: Neutron IPAM Driver
+| Document | Role |
+|---|---|
+| [EAB-CORE-DESIGN.md](EAB-CORE-DESIGN.md) | Technical reference for the EAB core: IPAM driver (R§4), agent (R§5), master (R§6), flows (R§7), error handling (R§8), operations (R§9–11). |
+| [EXTERNAL-NAT-REALIZATION.md](EXTERNAL-NAT-REALIZATION.md) | Technical reference for the external realization path: L3 flavor driver (X§6.1), master NAT extensions (X§6.2), NAT layer (X§6.4), flows (X§7). |
+| **README.md** (this document) | Decisions (§5), consolidated invariants and data model (§4, §7), gap closure (§6, §8–§10), milestone plan (§11). Supersedes "open" / "to be decided" statements in the other two. |
 
-### 4.1 Repository Structure
+## 3. Analysis: What Is Specified vs. What Was Open
 
-```
-networking-external-address-broker/
-├── setup.cfg
-├── setup.py
-├── pyproject.toml
-├── README.rst
-├── requirements.txt
-├── test-requirements.txt
-├── tox.ini
-├── networking_external_address_broker/
-│   ├── __init__.py
-│   ├── version.py
-│   ├── ipam/
-│   │   ├── __init__.py
-│   │   └── driver.py
-│   ├── client/
-│   │   ├── __init__.py
-│   │   └── agent_client.py
-│   ├── callbacks/
-│   │   ├── __init__.py
-│   │   └── floating_ip.py
-│   ├── common/
-│   │   ├── __init__.py
-│   │   └── config.py
-│   └── tests/
-│       ├── __init__.py
-│       ├── unit/
-│       │   ├── __init__.py
-│       │   ├── test_driver.py
-│       │   └── test_callbacks.py
-│       └── functional/
-│           ├── __init__.py
-│           └── test_integration.py
-├── eab_agent/
-│   ├── __init__.py
-│   ├── app.py
-│   ├── cache.py
-│   ├── config.py
-│   ├── master_client.py
-│   └── tests/
-│       └── ...
-├── eab_master/
-│   ├── __init__.py
-│   ├── app.py
-│   ├── db/
-│   │   ├── __init__.py
-│   │   ├── models.py
-│   │   └── migration/
-│   │       └── alembic/
-│   │           └── versions/
-│   ├── api/
-│   │   ├── __init__.py
-│   │   └── v1.py
-│   ├── config.py
-│   └── tests/
-│       └── ...
-└── etc/
-    ├── eab-agent.conf.sample
-    └── eab-master.conf.sample
-```
+### 3.1 Specified and implementable as-is
 
-### 4.2 setup.cfg
+- Allocation model with DB-enforced atomicity and race handling (R§6, R§8.3).
+- IPAM driver interception of floating IP allocations only, fail-closed semantics (R§4).
+- Agent design incl. cache, sync with grace period, heartbeat (R§5, R§7.3).
+- Authentication/authorization model: token bound to one CloudPod (R§11).
+- External NAT target architecture, packet flows, stateless NAT + BGP announce (X§4–X§7).
+- Operating rule for non-FIP ports on external networks (disjoint per-pod pools, R§8.6).
 
-```ini
-[metadata]
-name = networking-external-address-broker
-summary = Neutron IPAM driver for shared floating IPs across CloudPods
-description_file = README.rst
-license = Apache-2.0
-classifier =
-    Environment :: OpenStack
-    Intended Audience :: Information Technology
-    License :: OSI Approved :: Apache Software License
-    Operating System :: POSIX :: Linux
-    Programming Language :: Python :: 3
-    Programming Language :: Python :: 3.10
-    Programming Language :: Python :: 3.11
+### 3.2 Open until now — resolved in this document
 
-[options]
-packages = find:
-python_requires = >=3.10
-install_requires =
-    neutron-lib>=3.0.0
-    oslo.config>=9.0.0
-    oslo.log>=5.0.0
-    requests>=2.28.0
-
-[options.extras_require]
-# The IPAM driver is imported into neutron-server and must stay lightweight;
-# agent and master pull their service dependencies via extras
-# (pip install networking-external-address-broker[agent]).
-agent =
-    fastapi>=0.115.0
-    uvicorn>=0.34.0
-master =
-    fastapi>=0.115.0
-    uvicorn>=0.34.0
-    SQLAlchemy>=2.0
-    alembic>=1.13
-    netaddr>=1.0
-    oslo.utils>=7.0.0
-
-[options.packages.find]
-exclude =
-    *.tests.*
-
-[entry_points]
-neutron.ipam_drivers =
-    external_address_broker = networking_external_address_broker.ipam.driver:ExternalAddressBrokerPool
-
-oslo.config.opts =
-    networking_external_address_broker = networking_external_address_broker.common.config:list_opts
-
-console_scripts =
-    eab-agent = eab_agent.app:main
-    eab-master = eab_master.app:main
-```
-
-### 4.3 Configuration (neutron.conf)
-
-```ini
-[DEFAULT]
-ipam_driver = external_address_broker
-
-[external_address_broker]
-# URL of the local EAB agent
-agent_endpoint = http://localhost:9532
-
-# Timeout for requests to the agent (seconds)
-agent_timeout = 5
-
-# Whether the driver should fall back to local allocation on agent failure.
-# WARNING: When set to true, duplicate allocations are possible.
-fallback_to_local = false
-```
-
-### 4.4 Config Module
-
-```python
-# networking_external_address_broker/common/config.py
-
-from oslo_config import cfg
-
-EXTERNAL_ADDRESS_BROKER_GROUP = cfg.OptGroup(
-    name='external_address_broker',
-    title='External Address Broker Options',
-)
-
-EXTERNAL_ADDRESS_BROKER_OPTS = [
-    cfg.URIOpt(
-        'agent_endpoint',
-        default='http://localhost:9532',
-        help='URL of the local EAB agent.',
-    ),
-    cfg.IntOpt(
-        'agent_timeout',
-        default=5,
-        min=1,
-        max=30,
-        help='Timeout for requests to the EAB agent in seconds.',
-    ),
-    cfg.BoolOpt(
-        'fallback_to_local',
-        default=False,
-        help='Fall back to local allocation on agent failure. '
-             'WARNING: May lead to duplicate allocations.',
-    ),
-]
-
-
-def register_opts(conf):
-    conf.register_group(EXTERNAL_ADDRESS_BROKER_GROUP)
-    conf.register_opts(EXTERNAL_ADDRESS_BROKER_OPTS,
-                       group=EXTERNAL_ADDRESS_BROKER_GROUP)
-
-
-def list_opts():
-    return [(EXTERNAL_ADDRESS_BROKER_GROUP, EXTERNAL_ADDRESS_BROKER_OPTS)]
-```
-
-### 4.5 Agent Client (IPAM Driver -> local agent)
-
-```python
-# networking_external_address_broker/client/agent_client.py
-
-import requests as http_requests
-from oslo_config import cfg
-from oslo_log import log
-
-from networking_external_address_broker.common import config as eab_config
-
-LOG = log.getLogger(__name__)
-
-
-class AgentClientError(Exception):
-    pass
-
-
-class AgentUnavailableError(AgentClientError):
-    pass
-
-
-class AddressUnavailableError(AgentClientError):
-    pass
-
-
-class AgentClient:
-    """Client for communication with the local EAB agent."""
-
-    def __init__(self):
-        eab_config.register_opts(cfg.CONF)
-        self._endpoint = cfg.CONF.external_address_broker.agent_endpoint
-        self._timeout = cfg.CONF.external_address_broker.agent_timeout
-        self._session = http_requests.Session()
-
-    def reserve(self, network_id, subnet_id=None, project_id=None):
-        """Reserves an IP address via the agent from the master.
-
-        :param network_id: Neutron network ID of the external network
-        :param subnet_id: Optional restriction to a specific subnet
-        :param project_id: Project/tenant ID
-        :returns: dict with 'ip_address' and 'subnet_id'
-        :raises: AgentUnavailableError, AddressUnavailableError
-        """
-        payload = {
-            'network_id': network_id,
-            'project_id': project_id,
-        }
-        if subnet_id:
-            payload['subnet_id'] = subnet_id
-
-        try:
-            resp = self._session.post(
-                f'{self._endpoint}/v1/addresses/reserve',
-                json=payload,
-                timeout=self._timeout,
-            )
-        except http_requests.ConnectionError:
-            raise AgentUnavailableError(
-                f'EAB agent unreachable: {self._endpoint}'
-            )
-        except http_requests.Timeout:
-            raise AgentUnavailableError(
-                f'EAB agent timeout after {self._timeout}s'
-            )
-
-        if resp.status_code == 200:
-            return resp.json()
-        elif resp.status_code == 409:
-            raise AddressUnavailableError(resp.json().get('detail', ''))
-        elif resp.status_code == 503:
-            raise AgentUnavailableError(resp.json().get('detail', ''))
-        else:
-            raise AgentClientError(
-                f'Unexpected status {resp.status_code}: {resp.text}'
-            )
-
-    def reserve_specific(self, network_id, ip_address, project_id=None):
-        """Reserves a specific IP address.
-
-        :param network_id: Neutron network ID
-        :param ip_address: The requested IP address
-        :param project_id: Project/tenant ID
-        :returns: dict with 'ip_address' and 'subnet_id'
-        :raises: AgentUnavailableError, AddressUnavailableError
-        """
-        payload = {
-            'network_id': network_id,
-            'ip_address': ip_address,
-            'project_id': project_id,
-        }
-
-        try:
-            resp = self._session.post(
-                f'{self._endpoint}/v1/addresses/reserve',
-                json=payload,
-                timeout=self._timeout,
-            )
-        except (http_requests.ConnectionError, http_requests.Timeout) as e:
-            raise AgentUnavailableError(str(e))
-
-        if resp.status_code == 200:
-            return resp.json()
-        elif resp.status_code == 409:
-            raise AddressUnavailableError(
-                f'IP {ip_address} is already allocated'
-            )
-        else:
-            raise AgentClientError(
-                f'Unexpected status {resp.status_code}: {resp.text}'
-            )
-
-    def release(self, ip_address, network_id):
-        """Releases an IP address.
-
-        :param ip_address: The IP address to release
-        :param network_id: Neutron network ID
-        """
-        payload = {
-            'ip_address': ip_address,
-            'network_id': network_id,
-        }
-
-        try:
-            resp = self._session.post(
-                f'{self._endpoint}/v1/addresses/release',
-                json=payload,
-                timeout=self._timeout,
-            )
-        except (http_requests.ConnectionError, http_requests.Timeout):
-            LOG.error(
-                'EAB agent unreachable during release of %s. '
-                'Address must be released manually.',
-                ip_address,
-            )
-            return
-
-        if resp.status_code not in (200, 404):
-            LOG.error(
-                'Error releasing %s: %s %s',
-                ip_address, resp.status_code, resp.text,
-            )
-```
-
-### 4.6 IPAM Driver
-
-```python
-# networking_external_address_broker/ipam/driver.py
-
-from neutron_lib import constants
-from neutron_lib.plugins import directory
-from oslo_config import cfg
-from oslo_log import log
-
-from neutron.ipam import driver as ipam_base
-from neutron.ipam.drivers.neutrondb_ipam import driver as neutrondb_driver
-from neutron.ipam import requests as ipam_req
-
-from networking_external_address_broker.client import agent_client
-from networking_external_address_broker.common import config as eab_config
-
-LOG = log.getLogger(__name__)
-
-
-def _is_external_network(context, network_id):
-    """Checks whether a network is an external network."""
-    plugin = directory.get_plugin()
-    network = plugin.get_network(context, network_id)
-    return network.get('router:external', False)
-
-
-class ExternalAddressBrokerAddressRequestFactory(
-        ipam_req.AddressRequestFactory):
-    """AddressRequestFactory that routes floating IP allocations on external
-    networks through the EAB agent.
-
-    For all other allocations, the default behavior is used.
-    """
-
-    @classmethod
-    def get_request(cls, context, port, ip_dict):
-        # Only intercept floating IP ports; everything else (DHCP, router,
-        # regular ports, ...) uses the default behavior.
-        if port.get('device_owner') != constants.DEVICE_OWNER_FLOATINGIP:
-            return super().get_request(context, port, ip_dict)
-
-        # Fail closed: if the external-network check raises, the request
-        # fails instead of falling through to the local allocator.
-        if not _is_external_network(context, port.get('network_id')):
-            return super().get_request(context, port, ip_dict)
-
-        # Broker errors (agent unreachable, pool exhausted) must propagate.
-        # If they were caught here, the request would fall through to the
-        # local allocator and silently bypass the duplicate protection —
-        # even with fallback_to_local = false.
-        if ip_dict.get('ip_address'):
-            return cls._request_specific_from_broker(context, port, ip_dict)
-        return cls._request_from_broker(context, port, ip_dict)
-
-    @classmethod
-    def _request_from_broker(cls, context, port, ip_dict):
-        """Automatic IP allocation via the broker."""
-        client = agent_client.AgentClient()
-        fallback = cfg.CONF.external_address_broker.fallback_to_local
-
-        try:
-            result = client.reserve(
-                network_id=port['network_id'],
-                subnet_id=ip_dict.get('subnet_id'),
-                project_id=port.get('project_id') or port.get('tenant_id'),
-            )
-            LOG.info(
-                'EAB: IP %s reserved for network %s',
-                result['ip_address'], port['network_id'],
-            )
-            # Update subnet_id in ip_dict so the IPAM allocator
-            # uses the correct subnet
-            if result.get('subnet_id'):
-                ip_dict['subnet_id'] = result['subnet_id']
-            return ipam_req.SpecificAddressRequest(result['ip_address'])
-
-        except agent_client.AgentUnavailableError:
-            if fallback:
-                LOG.warning(
-                    'EAB agent unreachable, falling back to local '
-                    'allocation for network %s',
-                    port['network_id'],
-                )
-                return ipam_req.AnyAddressRequest()
-            raise
-
-        except agent_client.AddressUnavailableError:
-            from neutron_lib import exceptions as n_exc
-            raise n_exc.ExternalIpAddressExhausted(
-                net_id=port['network_id'],
-            )
-
-    @classmethod
-    def _request_specific_from_broker(cls, context, port, ip_dict):
-        """Validate a specific IP request via the broker."""
-        client = agent_client.AgentClient()
-
-        try:
-            result = client.reserve_specific(
-                network_id=port['network_id'],
-                ip_address=ip_dict['ip_address'],
-                project_id=port.get('project_id') or port.get('tenant_id'),
-            )
-            LOG.info(
-                'EAB: Specific IP %s reserved for network %s',
-                result['ip_address'], port['network_id'],
-            )
-            return ipam_req.SpecificAddressRequest(result['ip_address'])
-
-        except agent_client.AddressUnavailableError:
-            from neutron.ipam import exceptions as ipam_exc
-            raise ipam_exc.IpAddressAlreadyAllocated(
-                subnet_id=ip_dict.get('subnet_id', 'unknown'),
-                ip=ip_dict['ip_address'],
-            )
-
-
-class ExternalAddressBrokerPool(neutrondb_driver.NeutronDbPool):
-    """IPAM pool that overrides the AddressRequestFactory.
-
-    All subnet operations (allocate_subnet, update_subnet, remove_subnet,
-    get_subnet) are handled unchanged by NeutronDbPool.
-    Only address allocation for floating IPs is routed through the broker.
-    """
-
-    def get_address_request_factory(self):
-        return ExternalAddressBrokerAddressRequestFactory
-```
-
-### 4.7 Floating IP Delete Callback
-
-```python
-# networking_external_address_broker/callbacks/floating_ip.py
-
-from neutron_lib.callbacks import events
-from neutron_lib.callbacks import registry
-from neutron_lib.callbacks import resources
-from oslo_log import log
-
-from networking_external_address_broker.client import agent_client
-
-LOG = log.getLogger(__name__)
-
-
-@registry.receives(resources.FLOATING_IP, [events.AFTER_DELETE])
-def release_floating_ip_on_delete(resource, event, trigger, payload):
-    """Releases the floating IP at the broker when it is deleted
-    in Neutron."""
-    fip = payload.latest_state
-    if not fip:
-        LOG.warning('EAB: AFTER_DELETE event received without FIP data')
-        return
-
-    ip_address = fip.get('floating_ip_address')
-    network_id = fip.get('floating_network_id')
-
-    if not ip_address or not network_id:
-        return
-
-    LOG.info('EAB: Releasing IP %s on network %s', ip_address, network_id)
-    client = agent_client.AgentClient()
-    client.release(ip_address=ip_address, network_id=network_id)
-```
-
-### 4.8 Callback Registration
-
-Registration happens automatically via the `@registry.receives` decorator.
-For the callback to be loaded, the module must be imported. The most robust
-place is the IPAM driver module itself — it is guaranteed to be imported by
-neutron-server whenever `ipam_driver = external_address_broker` is set:
-
-```python
-# At the bottom of networking_external_address_broker/ipam/driver.py
-from networking_external_address_broker.callbacks import floating_ip  # noqa: F401,E402
-```
-
-(Abusing an unrelated entry-point group such as `neutron.policies` to force
-the import works, but is surprising to operators and may break on Neutron
-upgrades.)
-
-Note that the `AFTER_DELETE` callback alone does not cover every
-deallocation path: if the port creation fails *after* the broker reservation
-succeeded (quota error, DB deadlock/rollback, ...), Neutron rolls back the
-IPAM allocation without emitting a floating IP `AFTER_DELETE` event. Such
-leaked reservations are cleaned up by the periodic sync (Section 7.3). A
-planned improvement is to also release from the IPAM deallocate path itself
-(see Section 12.2).
-
-## 5. Component: EAB Agent (per CloudPod)
-
-The EAB agent runs as a standalone service on each CloudPod. It mediates
-between the Neutron IPAM driver (local) and the EAB master (central).
-
-In deployments with multiple controller nodes, run one agent instance on
-every node where neutron-server runs (the driver talks to `localhost`), or
-run the agents behind a pod-local VIP. Apart from its cache the agent is
-stateless, so any number of instances can run in parallel.
-
-### 5.1 Responsibilities
-
-- Accepts reserve/release requests from the IPAM driver
-- Forwards these to the EAB master
-- Maintains a local cache of current allocations
-- Performs periodic sync reconciliation with the master
-- Reports its health status to the master
-
-### 5.2 Configuration (eab-agent.conf)
-
-```ini
-[DEFAULT]
-log_file = /var/log/eab/eab-agent.log
-
-[agent]
-# Unique ID of this CloudPod
-cloudpod_id = cloudpod-a
-
-# Display name
-cloudpod_name = CloudPod Frankfurt 1
-
-# Bind address for the local API
-bind_host = 127.0.0.1
-bind_port = 9532
-
-[master]
-# URL of the EAB master
-endpoint = https://eab-master.example.com:9533
-
-# Authentication towards the master
-auth_token = <shared-secret-or-jwt>
-
-# Timeout for master requests (seconds)
-timeout = 10
-
-# Retry behavior on master failure
-max_retries = 3
-retry_interval = 1
-
-[sync]
-# Interval for periodic full sync (seconds)
-full_sync_interval = 60
-
-# Interval for heartbeat to master (seconds)
-heartbeat_interval = 10
-
-[cache]
-# Local cache for allocations
-# Allows fast lookups without master roundtrip
-enabled = true
-
-[neutron]
-# Read-only Keystone credentials used by the reconcile loop to list the
-# floating IPs that exist locally in Neutron (see Section 7.3).
-auth_url = https://keystone.cloudpod-a.example.com/v3
-username = eab-agent
-password = <secret>
-project_name = service
-user_domain_name = Default
-project_domain_name = Default
-```
-
-### 5.3 API (local, only reachable from Neutron)
-
-#### POST /v1/addresses/reserve
-
-Reserves an IP address. Forwards the request to the master.
-
-Request:
-```json
-{
-    "network_id": "uuid-of-external-network",
-    "subnet_id": "uuid-of-subnet (optional)",
-    "project_id": "uuid-of-project"
-}
-```
-
-Response (200):
-```json
-{
-    "ip_address": "198.51.100.42",
-    "subnet_id": "uuid-of-subnet",
-    "network_id": "uuid-of-external-network",
-    "reservation_id": "uuid-of-reservation"
-}
-```
-
-Errors:
-- 409: No free address available / specific address already allocated
-- 503: Master unreachable (and no fallback configured)
-
-#### POST /v1/addresses/release
-
-Releases an IP address.
-
-Request:
-```json
-{
-    "ip_address": "198.51.100.42",
-    "network_id": "uuid-of-external-network"
-}
-```
-
-Response (200):
-```json
-{
-    "ip_address": "198.51.100.42",
-    "status": "released"
-}
-```
-
-#### GET /v1/health
-
-Health check endpoint.
-
-Response (200):
-```json
-{
-    "status": "healthy",
-    "master_connected": true,
-    "last_sync": "2026-03-19T10:30:00Z",
-    "cache_size": 42
-}
-```
-
-### 5.4 Implementation
-
-```python
-# eab_agent/app.py
-
-import asyncio
-from contextlib import asynccontextmanager
-
-import uvicorn
-from fastapi import FastAPI, HTTPException
-from oslo_config import cfg
-from oslo_log import log
-from pydantic import BaseModel
-
-from eab_agent import cache as agent_cache
-from eab_agent import config as agent_config
-from eab_agent import master_client
-
-LOG = log.getLogger(__name__)
-
-_master = None
-_cache = None
-_config = None
-
-
-class ReserveRequest(BaseModel):
-    network_id: str
-    subnet_id: str | None = None
-    ip_address: str | None = None
-    project_id: str | None = None
-
-
-class ReleaseRequest(BaseModel):
-    ip_address: str
-    network_id: str
-
-
-def setup():
-    global _master, _cache, _config
-    agent_config.register_opts(cfg.CONF)
-    cfg.CONF(project='eab-agent')
-    log.setup(cfg.CONF, 'eab-agent')
-
-    _config = cfg.CONF
-    _master = master_client.MasterClient(
-        endpoint=_config.master.endpoint,
-        auth_token=_config.master.auth_token,
-        timeout=_config.master.timeout,
-        cloudpod_id=_config.agent.cloudpod_id,
-        max_retries=_config.master.max_retries,
-        retry_interval=_config.master.retry_interval,
-    )
-    _cache = agent_cache.AllocationCache()
-
-
-async def _sync_loop():
-    """Periodic reconciliation with the master."""
-    while True:
-        try:
-            # requests is blocking — keep it off the event loop
-            allocations = await asyncio.to_thread(_master.get_allocations)
-            _cache.full_sync(allocations)
-            LOG.debug('Full sync completed, %d entries', len(allocations))
-        except Exception:
-            LOG.exception('Error during full sync')
-        await asyncio.sleep(_config.sync.full_sync_interval)
-
-
-async def _heartbeat_loop():
-    """Periodic heartbeat to the master."""
-    while True:
-        try:
-            await asyncio.to_thread(_master.heartbeat)
-        except Exception:
-            LOG.warning('Heartbeat to master failed')
-        await asyncio.sleep(_config.sync.heartbeat_interval)
-
-
-@asynccontextmanager
-async def lifespan(application: FastAPI):
-    """Start background tasks on startup, cancel on shutdown."""
-    sync_task = asyncio.create_task(_sync_loop())
-    heartbeat_task = asyncio.create_task(_heartbeat_loop())
-    yield
-    sync_task.cancel()
-    heartbeat_task.cancel()
-
-
-app = FastAPI(lifespan=lifespan)
-
-
-@app.post('/v1/addresses/reserve')
-def reserve_address(data: ReserveRequest):
-    try:
-        if data.ip_address:
-            result = _master.reserve_specific(
-                network_id=data.network_id,
-                ip_address=data.ip_address,
-                project_id=data.project_id,
-            )
-        else:
-            result = _master.reserve(
-                network_id=data.network_id,
-                subnet_id=data.subnet_id,
-                project_id=data.project_id,
-            )
-    except master_client.MasterUnavailableError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except master_client.AddressConflictError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-
-    _cache.add(result['ip_address'], result)
-    return result
-
-
-@app.post('/v1/addresses/release')
-def release_address(data: ReleaseRequest):
-    try:
-        _master.release(
-            ip_address=data.ip_address,
-            network_id=data.network_id,
-        )
-    except master_client.MasterUnavailableError:
-        LOG.error(
-            'Master unreachable during release of %s. '
-            'Will be cleaned up during next sync.',
-            data.ip_address,
-        )
-
-    _cache.remove(data.ip_address)
-    return {'ip_address': data.ip_address, 'status': 'released'}
-
-
-@app.get('/v1/health')
-def health():
-    master_ok = _master.ping()
-    return {
-        'status': 'healthy' if master_ok else 'degraded',
-        'master_connected': master_ok,
-        'last_sync': _cache.last_sync_time,
-        'cache_size': _cache.size,
-    }
-
-
-def main():
-    setup()
-    uvicorn.run(
-        app,
-        host=_config.agent.bind_host,
-        port=_config.agent.bind_port,
-    )
-```
-
-### 5.5 Master Client (Agent -> Master)
-
-```python
-# eab_agent/master_client.py
-
-import requests as http_requests
-from oslo_log import log
-
-LOG = log.getLogger(__name__)
-
-
-class MasterUnavailableError(Exception):
-    pass
-
-
-class AddressConflictError(Exception):
-    pass
-
-
-class MasterClient:
-    """Client for agent -> master communication."""
-
-    def __init__(self, endpoint, auth_token, timeout, cloudpod_id,
-                 max_retries=3, retry_interval=1):
-        self._endpoint = endpoint
-        self._timeout = timeout
-        self._cloudpod_id = cloudpod_id
-        self._max_retries = max_retries
-        self._retry_interval = retry_interval
-        self._session = http_requests.Session()
-        self._session.headers.update({
-            'Authorization': f'Bearer {auth_token}',
-            'X-CloudPod-ID': cloudpod_id,
-        })
-
-    def _request(self, method, path, **kwargs):
-        """Request with retry logic."""
-        url = f'{self._endpoint}{path}'
-        last_exc = None
-
-        for attempt in range(self._max_retries):
-            try:
-                resp = self._session.request(
-                    method, url, timeout=self._timeout, **kwargs,
-                )
-                return resp
-            except (http_requests.ConnectionError,
-                    http_requests.Timeout) as e:
-                last_exc = e
-                LOG.warning(
-                    'Master request failed (attempt %d/%d): %s',
-                    attempt + 1, self._max_retries, e,
-                )
-                if attempt < self._max_retries - 1:
-                    import time
-                    time.sleep(self._retry_interval)
-
-        raise MasterUnavailableError(
-            f'Master unreachable after {self._max_retries} attempts: '
-            f'{last_exc}'
-        )
-
-    def reserve(self, network_id, subnet_id=None, project_id=None):
-        payload = {
-            'network_id': network_id,
-            'cloudpod_id': self._cloudpod_id,
-            'project_id': project_id,
-        }
-        if subnet_id:
-            payload['subnet_id'] = subnet_id
-
-        resp = self._request('POST', '/v1/addresses/reserve', json=payload)
-
-        if resp.status_code == 200:
-            return resp.json()
-        elif resp.status_code == 409:
-            raise AddressConflictError(resp.json().get('detail', ''))
-        else:
-            raise MasterUnavailableError(
-                f'Unexpected response: {resp.status_code}'
-            )
-
-    def reserve_specific(self, network_id, ip_address, project_id=None):
-        payload = {
-            'network_id': network_id,
-            'ip_address': ip_address,
-            'cloudpod_id': self._cloudpod_id,
-            'project_id': project_id,
-        }
-        resp = self._request('POST', '/v1/addresses/reserve', json=payload)
-
-        if resp.status_code == 200:
-            return resp.json()
-        elif resp.status_code == 409:
-            raise AddressConflictError(
-                f'IP {ip_address} already allocated'
-            )
-        else:
-            raise MasterUnavailableError(
-                f'Unexpected response: {resp.status_code}'
-            )
-
-    def release(self, ip_address, network_id):
-        payload = {
-            'ip_address': ip_address,
-            'network_id': network_id,
-            'cloudpod_id': self._cloudpod_id,
-        }
-        resp = self._request('POST', '/v1/addresses/release', json=payload)
-
-        if resp.status_code not in (200, 404):
-            LOG.error('Error during release: %s %s',
-                      resp.status_code, resp.text)
-
-    def get_allocations(self):
-        """Fetches all allocations for sync."""
-        resp = self._request('GET', '/v1/addresses')
-        if resp.status_code == 200:
-            return resp.json().get('allocations', [])
-        raise MasterUnavailableError(
-            f'Sync failed: {resp.status_code}'
-        )
-
-    def heartbeat(self):
-        resp = self._request('POST', '/v1/cloudpods/heartbeat', json={
-            'cloudpod_id': self._cloudpod_id,
-        })
-        return resp.status_code == 200
-
-    def ping(self):
-        try:
-            resp = self._request('GET', '/v1/health')
-            return resp.status_code == 200
-        except MasterUnavailableError:
-            return False
-```
-
-### 5.6 Local Cache
-
-```python
-# eab_agent/cache.py
-
-import datetime
-import threading
-
-
-class AllocationCache:
-    """Thread-safe in-memory cache for IP allocations.
-
-    The cache primarily serves as a quick overview and is updated
-    during the full sync with the master.
-    """
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._allocations = {}  # ip_address -> allocation_data
-        self._last_sync = None
-
-    def add(self, ip_address, data):
-        with self._lock:
-            self._allocations[ip_address] = data
-
-    def remove(self, ip_address):
-        with self._lock:
-            self._allocations.pop(ip_address, None)
-
-    def get(self, ip_address):
-        with self._lock:
-            return self._allocations.get(ip_address)
-
-    def is_allocated(self, ip_address):
-        with self._lock:
-            return ip_address in self._allocations
-
-    def full_sync(self, allocations):
-        """Replaces the cache entirely with data from the master."""
-        with self._lock:
-            self._allocations = {
-                a['ip_address']: a for a in allocations
-            }
-            self._last_sync = datetime.datetime.now(
-                tz=datetime.timezone.utc,
-            ).isoformat()
-
-    @property
-    def last_sync_time(self):
-        return self._last_sync
-
-    @property
-    def size(self):
-        with self._lock:
-            return len(self._allocations)
-```
-
-## 6. Component: EAB Master (central)
-
-The master is the single source of truth for all IP allocations across
-all CloudPods.
-
-### 6.1 Responsibilities
-
-- Maintains the authoritative database of all allocations
-- Accepts reserve/release requests from agents
-- Ensures atomicity for concurrent reservations
-- Manages registered CloudPods and their health status
-- Provides sync endpoints
-- Offers an admin API for manual interventions
-
-### 6.2 Configuration (eab-master.conf)
-
-```ini
-[DEFAULT]
-log_file = /var/log/eab/eab-master.log
-
-[master]
-# Bind address
-bind_host = 0.0.0.0
-bind_port = 9533
-
-[database]
-# SQLAlchemy connection string
-connection = postgresql://eab:password@localhost:5432/eab_master
-
-[auth]
-# Comma-separated cloudpod:token pairs. Binding each token to a CloudPod ID
-# is what enforces that an agent can only act for its own CloudPod (11.3).
-# In production: Keystone or another auth service
-agent_tokens = cloudpod-a:token-a,cloudpod-b:token-b,cloudpod-c:token-c
-
-# Separate token for the /v1/admin/* endpoints
-admin_token = <admin-token>
-
-[cleanup]
-# Interval in seconds for checking orphaned allocations
-orphan_check_interval = 300
-
-# After how many seconds without heartbeat a CloudPod is considered offline
-cloudpod_offline_timeout = 60
-```
-
-### 6.3 Data Model
-
-```python
-# eab_master/db/models.py
-
-import datetime
-
-from sqlalchemy import (
-    Boolean, Column, DateTime, ForeignKey, Index, Integer,
-    String, UniqueConstraint,
-)
-from sqlalchemy.orm import declarative_base, relationship
-
-Base = declarative_base()
-
-
-class CloudPod(Base):
-    """A registered CloudPod."""
-    __tablename__ = 'cloudpods'
-
-    id = Column(String(64), primary_key=True)  # e.g. "cloudpod-a"
-    name = Column(String(255), nullable=False)
-    last_heartbeat = Column(DateTime(timezone=True), nullable=True)
-    is_online = Column(Boolean, default=False, nullable=False)
-    created_at = Column(
-        DateTime(timezone=True),
-        default=lambda: datetime.datetime.now(tz=datetime.timezone.utc),
-    )
-
-    allocations = relationship('Allocation', back_populates='cloudpod')
-
-
-class ManagedSubnet(Base):
-    """A subnet managed by the broker.
-
-    References the subnet CIDRs configured on the external networks of the
-    CloudPods. The neutron_network_id can differ per CloudPod, but the CIDR
-    is identical.
-    """
-    __tablename__ = 'managed_subnets'
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    cidr = Column(String(64), nullable=False, unique=True)
-    name = Column(String(255), nullable=True)
-    gateway_ip = Column(String(64), nullable=True)
-    pool_start = Column(String(64), nullable=False)
-    pool_end = Column(String(64), nullable=False)
-    is_active = Column(Boolean, default=True, nullable=False)
-    created_at = Column(
-        DateTime(timezone=True),
-        default=lambda: datetime.datetime.now(tz=datetime.timezone.utc),
-    )
-
-    allocations = relationship('Allocation', back_populates='subnet')
-
-
-class NetworkMapping(Base):
-    """Mapping from CloudPod-specific Neutron network/subnet IDs
-    to managed subnets.
-
-    Each CloudPod has its own UUIDs for its networks and subnets,
-    but they reference the same physical network.
-    """
-    __tablename__ = 'network_mappings'
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    cloudpod_id = Column(
-        String(64), ForeignKey('cloudpods.id'), nullable=False,
-    )
-    neutron_network_id = Column(String(36), nullable=False)
-    neutron_subnet_id = Column(String(36), nullable=True)
-    managed_subnet_id = Column(
-        Integer, ForeignKey('managed_subnets.id'), nullable=False,
-    )
-
-    __table_args__ = (
-        UniqueConstraint(
-            'cloudpod_id', 'neutron_network_id',
-            name='uq_cloudpod_network',
-        ),
-    )
-
-    cloudpod = relationship('CloudPod')
-    managed_subnet = relationship('ManagedSubnet')
-
-
-class Allocation(Base):
-    """An IP address allocation."""
-    __tablename__ = 'allocations'
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    ip_address = Column(String(64), nullable=False)
-    managed_subnet_id = Column(
-        Integer, ForeignKey('managed_subnets.id'), nullable=False,
-    )
-    cloudpod_id = Column(
-        String(64), ForeignKey('cloudpods.id'), nullable=False,
-    )
-    project_id = Column(String(36), nullable=True)
-    reservation_id = Column(String(36), nullable=False, unique=True)
-    allocated_at = Column(
-        DateTime(timezone=True),
-        default=lambda: datetime.datetime.now(tz=datetime.timezone.utc),
-    )
-
-    __table_args__ = (
-        # An IP per subnet may only be allocated once
-        UniqueConstraint(
-            'ip_address', 'managed_subnet_id',
-            name='uq_ip_per_subnet',
-        ),
-        Index('ix_alloc_cloudpod', 'cloudpod_id'),
-        Index('ix_alloc_ip', 'ip_address'),
-    )
-
-    cloudpod = relationship('CloudPod', back_populates='allocations')
-    subnet = relationship('ManagedSubnet', back_populates='allocations')
-```
-
-### 6.4 ER Diagram
-
-```
-+---------------+       +-------------------+       +----------------+
-|  CloudPod     |       | NetworkMapping    |       | ManagedSubnet  |
-+---------------+       +-------------------+       +----------------+
-| id (PK)       |--+    | id (PK)           |   +-->| id (PK)        |
-| name          |  +--->| cloudpod_id (FK)  |   |   | cidr           |
-| last_heartbeat|  |    | neutron_network_id|   |   | pool_start     |
-| is_online     |  |    | neutron_subnet_id |   |   | pool_end       |
-+---------------+  |    | managed_subnet_id |---+   | is_active      |
-                   |    +-------------------+       +--------+-------+
-                   |                                         |
-                   |    +--------------------+               |
-                   |    | Allocation         |               |
-                   |    +--------------------+               |
-                   |    | id (PK)            |               |
-                   +--->| cloudpod_id (FK)   |               |
-                        | ip_address         |               |
-                        | managed_subnet_id. |<--------------+
-                        | project_id         |
-                        | reservation_id     |
-                        | allocated_at       |
-                        |                    |
-                        | UNIQUE(ip_address, |
-                        |  managed_subnet_id)|
-                        +--------------------+
-```
-
-### 6.5 Master API
-
-```python
-# eab_master/api/v1.py
-
-import datetime
-import hmac
-from collections.abc import Generator
-from typing import Annotated
-
-import netaddr
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from oslo_config import cfg
-from oslo_log import log
-from oslo_utils import uuidutils
-from pydantic import BaseModel
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
-
-from eab_master.db import models
-
-LOG = log.getLogger(__name__)
-
-
-# -----------------------------------------------------------------
-# Pydantic models
-# -----------------------------------------------------------------
-
-class ReserveRequest(BaseModel):
-    cloudpod_id: str
-    network_id: str
-    ip_address: str | None = None
-    subnet_id: str | None = None
-    project_id: str | None = None
-
-
-class ReleaseRequest(BaseModel):
-    ip_address: str
-    network_id: str
-
-
-class HeartbeatRequest(BaseModel):
-    cloudpod_id: str
-
-
-class CreateSubnetRequest(BaseModel):
-    cidr: str
-    name: str | None = None
-    gateway_ip: str | None = None
-    pool_start: str
-    pool_end: str
-
-
-class CreateCloudPodRequest(BaseModel):
-    id: str
-    name: str
-
-
-class CreateMappingRequest(BaseModel):
-    cloudpod_id: str
-    neutron_network_id: str
-    neutron_subnet_id: str | None = None
-    managed_subnet_id: int
-
-
-# -----------------------------------------------------------------
-# App factory
-# -----------------------------------------------------------------
-
-def create_app(session_factory):
-    app = FastAPI()
-
-    def get_db() -> Generator[Session]:
-        db = session_factory()
-        try:
-            yield db
-        finally:
-            db.close()
-
-    def authenticate(
-        authorization: Annotated[str, Header()] = '',
-    ) -> str:
-        """Validates the agent token and returns the CloudPod it is bound to.
-
-        The acting CloudPod is always derived from the token — never from
-        client-supplied headers or body fields. This is what enforces the
-        authorization model in Section 11.3.
-        """
-        token = authorization.replace('Bearer ', '')
-        for pair in cfg.CONF.auth.agent_tokens.split(','):
-            cloudpod_id, pod_token = pair.split(':', 1)
-            if hmac.compare_digest(token, pod_token):
-                return cloudpod_id
-        raise HTTPException(status_code=401, detail='Unauthorized')
-
-    def authenticate_admin(
-        authorization: Annotated[str, Header()] = '',
-    ) -> None:
-        """Validates the admin token for /v1/admin/* endpoints."""
-        token = authorization.replace('Bearer ', '')
-        if not hmac.compare_digest(token, cfg.CONF.auth.admin_token):
-            raise HTTPException(status_code=401, detail='Unauthorized')
-
-    # -----------------------------------------------------------------
-    # Address Management
-    # -----------------------------------------------------------------
-
-    @app.post('/v1/addresses/reserve')
-    def reserve_address(
-        data: ReserveRequest,
-        db: Session = Depends(get_db),
-        caller_pod: str = Depends(authenticate),
-    ):
-        """Atomically reserves an IP address.
-
-        Expected body:
-            - network_id: Neutron network UUID of the requesting CloudPod
-            - cloudpod_id: ID of the CloudPod (must match the caller's token)
-            - ip_address: (optional) specific IP
-            - subnet_id: (optional) restriction to subnet
-            - project_id: (optional) tenant/project
-        """
-        if data.cloudpod_id != caller_pod:
-            raise HTTPException(
-                status_code=403,
-                detail='Token is not valid for this CloudPod',
-            )
-
-        # Find mapping: which ManagedSubnet belongs to this
-        # CloudPod + network combination?
-        mapping = db.execute(
-            select(models.NetworkMapping).where(
-                models.NetworkMapping.cloudpod_id == data.cloudpod_id,
-                models.NetworkMapping.neutron_network_id == data.network_id,
-            )
-        ).scalar_one_or_none()
-
-        if not mapping:
-            raise HTTPException(
-                status_code=404,
-                detail=f'No mapping found for CloudPod {data.cloudpod_id} '
-                       f'and network {data.network_id}',
-            )
-
-        managed_subnet = db.get(
-            models.ManagedSubnet, mapping.managed_subnet_id,
-        )
-        if not managed_subnet or not managed_subnet.is_active:
-            raise HTTPException(
-                status_code=409, detail='Subnet is not active',
-            )
-
-        if data.ip_address:
-            # Specific IP: validate against the managed pool first —
-            # otherwise any typo becomes a permanent allocation record.
-            pool = netaddr.IPRange(
-                managed_subnet.pool_start, managed_subnet.pool_end,
-            )
-            if netaddr.IPAddress(data.ip_address) not in pool:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f'IP {data.ip_address} is outside the managed '
-                           f'pool {managed_subnet.pool_start}-'
-                           f'{managed_subnet.pool_end}',
-                )
-            try:
-                return _insert_allocation(
-                    db, data, mapping, managed_subnet, data.ip_address,
-                )
-            except IntegrityError:
-                db.rollback()
-                raise HTTPException(
-                    status_code=409,
-                    detail=f'IP {data.ip_address} is already allocated',
-                )
-
-        # Automatic allocation: two CloudPods may race for the same "next
-        # free" IP. The UNIQUE constraint makes the loser fail with an
-        # IntegrityError — retry with the next candidate instead of
-        # reporting pool exhaustion (see Section 8.3).
-        for _attempt in range(5):
-            alloc_ip = _find_free_ip(db, managed_subnet)
-            if not alloc_ip:
-                raise HTTPException(
-                    status_code=409,
-                    detail='No free IP address available',
-                )
-            try:
-                return _insert_allocation(
-                    db, data, mapping, managed_subnet, alloc_ip,
-                )
-            except IntegrityError:
-                db.rollback()
-                LOG.info('Lost allocation race for %s, retrying', alloc_ip)
-
-        raise HTTPException(
-            status_code=503,
-            detail='Could not allocate an IP after several attempts',
-        )
-
-    @app.post('/v1/addresses/release')
-    def release_address(
-        data: ReleaseRequest,
-        db: Session = Depends(get_db),
-        caller_pod: str = Depends(authenticate),
-    ):
-        """Releases an IP address.
-
-        The allocation is looked up via the *authenticated* CloudPod
-        (derived from the token), never via client-supplied headers — an
-        agent cannot release an address held by another CloudPod.
-        """
-        try:
-            allocation = db.execute(
-                select(models.Allocation).where(
-                    models.Allocation.ip_address == data.ip_address,
-                    models.Allocation.cloudpod_id == caller_pod,
-                )
-            ).scalar_one_or_none()
-
-            if not allocation:
-                raise HTTPException(
-                    status_code=404, detail='Allocation not found',
-                )
-
-            db.delete(allocation)
-            db.commit()
-
-            LOG.info(
-                'IP %s released (CloudPod: %s)',
-                data.ip_address, caller_pod,
-            )
-            return {
-                'ip_address': data.ip_address,
-                'status': 'released',
-            }
-
-        except HTTPException:
-            raise
-
-        except Exception:
-            db.rollback()
-            LOG.exception('Error during release')
-            raise HTTPException(status_code=500, detail='Internal error')
-
-    @app.get('/v1/addresses')
-    def list_allocations(
-        cloudpod_id: str | None = Query(default=None),
-        db: Session = Depends(get_db),
-        _token: str = Depends(authenticate),
-    ):
-        """Lists all allocations. Used by the agent for full sync.
-
-        Optional query parameters:
-            - cloudpod_id: Filter by CloudPod
-        """
-        query = select(models.Allocation)
-
-        if cloudpod_id:
-            query = query.where(
-                models.Allocation.cloudpod_id == cloudpod_id,
-            )
-
-        allocations = db.execute(query).scalars().all()
-
-        return {
-            'allocations': [
-                {
-                    'ip_address': a.ip_address,
-                    'cloudpod_id': a.cloudpod_id,
-                    'managed_subnet_id': a.managed_subnet_id,
-                    'project_id': a.project_id,
-                    'reservation_id': a.reservation_id,
-                    'allocated_at': a.allocated_at.isoformat(),
-                }
-                for a in allocations
-            ],
-        }
-
-    # -----------------------------------------------------------------
-    # CloudPod Management
-    # -----------------------------------------------------------------
-
-    @app.post('/v1/cloudpods/heartbeat')
-    def cloudpod_heartbeat(
-        data: HeartbeatRequest,
-        db: Session = Depends(get_db),
-        caller_pod: str = Depends(authenticate),
-    ):
-        if data.cloudpod_id != caller_pod:
-            raise HTTPException(
-                status_code=403,
-                detail='Token is not valid for this CloudPod',
-            )
-        cloudpod = db.get(models.CloudPod, data.cloudpod_id)
-        if not cloudpod:
-            raise HTTPException(
-                status_code=404, detail='CloudPod not registered',
-            )
-
-        cloudpod.last_heartbeat = datetime.datetime.now(
-            tz=datetime.timezone.utc,
-        )
-        cloudpod.is_online = True
-        db.commit()
-        return {'status': 'ok'}
-
-    @app.get('/v1/cloudpods')
-    def list_cloudpods(
-        db: Session = Depends(get_db),
-        _token: str = Depends(authenticate),
-    ):
-        cloudpods = db.execute(select(models.CloudPod)).scalars().all()
-        return {
-            'cloudpods': [
-                {
-                    'id': c.id,
-                    'name': c.name,
-                    'is_online': c.is_online,
-                    'last_heartbeat': (
-                        c.last_heartbeat.isoformat()
-                        if c.last_heartbeat else None
-                    ),
-                }
-                for c in cloudpods
-            ],
-        }
-
-    # -----------------------------------------------------------------
-    # Admin: Subnet & Mapping Management
-    # -----------------------------------------------------------------
-
-    @app.get('/v1/admin/subnets')
-    def list_managed_subnets(
-        db: Session = Depends(get_db),
-        _admin: None = Depends(authenticate_admin),
-    ):
-        subnets = db.execute(
-            select(models.ManagedSubnet)
-        ).scalars().all()
-        return {
-            'subnets': [
-                {
-                    'id': s.id,
-                    'cidr': s.cidr,
-                    'name': s.name,
-                    'pool_start': s.pool_start,
-                    'pool_end': s.pool_end,
-                    'is_active': s.is_active,
-                }
-                for s in subnets
-            ],
-        }
-
-    @app.post('/v1/admin/subnets', status_code=201)
-    def create_managed_subnet(
-        data: CreateSubnetRequest,
-        db: Session = Depends(get_db),
-        _admin: None = Depends(authenticate_admin),
-    ):
-        try:
-            subnet = models.ManagedSubnet(
-                cidr=data.cidr,
-                name=data.name,
-                gateway_ip=data.gateway_ip,
-                pool_start=data.pool_start,
-                pool_end=data.pool_end,
-            )
-            db.add(subnet)
-            db.commit()
-            return {'id': subnet.id, 'cidr': subnet.cidr}
-        except IntegrityError:
-            db.rollback()
-            raise HTTPException(
-                status_code=409,
-                detail=f'Subnet {data.cidr} already exists',
-            )
-
-    @app.post('/v1/admin/cloudpods', status_code=201)
-    def create_cloudpod(
-        data: CreateCloudPodRequest,
-        db: Session = Depends(get_db),
-        _admin: None = Depends(authenticate_admin),
-    ):
-        try:
-            cloudpod = models.CloudPod(
-                id=data.id,
-                name=data.name,
-            )
-            db.add(cloudpod)
-            db.commit()
-            return {'id': cloudpod.id, 'name': cloudpod.name}
-        except IntegrityError:
-            db.rollback()
-            raise HTTPException(
-                status_code=409,
-                detail=f'CloudPod {data.id} already exists',
-            )
-
-    @app.post('/v1/admin/mappings', status_code=201)
-    def create_network_mapping(
-        data: CreateMappingRequest,
-        db: Session = Depends(get_db),
-        _admin: None = Depends(authenticate_admin),
-    ):
-        try:
-            mapping = models.NetworkMapping(
-                cloudpod_id=data.cloudpod_id,
-                neutron_network_id=data.neutron_network_id,
-                neutron_subnet_id=data.neutron_subnet_id,
-                managed_subnet_id=data.managed_subnet_id,
-            )
-            db.add(mapping)
-            db.commit()
-            return {'id': mapping.id}
-        except IntegrityError:
-            db.rollback()
-            raise HTTPException(
-                status_code=409, detail='Mapping already exists',
-            )
-
-    @app.get('/v1/admin/mappings')
-    def list_network_mappings(
-        db: Session = Depends(get_db),
-        _admin: None = Depends(authenticate_admin),
-    ):
-        mappings = db.execute(
-            select(models.NetworkMapping)
-        ).scalars().all()
-        return {
-            'mappings': [
-                {
-                    'id': m.id,
-                    'cloudpod_id': m.cloudpod_id,
-                    'neutron_network_id': m.neutron_network_id,
-                    'neutron_subnet_id': m.neutron_subnet_id,
-                    'managed_subnet_id': m.managed_subnet_id,
-                }
-                for m in mappings
-            ],
-        }
-
-    # -----------------------------------------------------------------
-    # Health
-    # -----------------------------------------------------------------
-
-    @app.get('/v1/health')
-    def health():
-        return {'status': 'healthy'}
-
-    return app
-
-
-def _find_free_ip(db, managed_subnet):
-    """Finds the next free IP in the pool.
-
-    Iterates over the IP range and checks against existing allocations.
-    """
-    allocated = {
-        row.ip_address for row in db.execute(
-            select(models.Allocation.ip_address).where(
-                models.Allocation.managed_subnet_id == managed_subnet.id,
-            )
-        ).all()
-    }
-
-    pool = netaddr.IPRange(managed_subnet.pool_start, managed_subnet.pool_end)
-    for ip in pool:
-        ip_str = str(ip)
-        if ip_str not in allocated:
-            return ip_str
-
-    return None
-
-
-def _insert_allocation(db, data, mapping, managed_subnet, alloc_ip):
-    """Inserts one allocation row; raises IntegrityError on conflicts."""
-    reservation_id = uuidutils.generate_uuid()
-    allocation = models.Allocation(
-        ip_address=alloc_ip,
-        managed_subnet_id=managed_subnet.id,
-        cloudpod_id=data.cloudpod_id,
-        project_id=data.project_id,
-        reservation_id=reservation_id,
-    )
-    db.add(allocation)
-    db.commit()
-    return {
-        'ip_address': alloc_ip,
-        'subnet_id': mapping.neutron_subnet_id,
-        'network_id': data.network_id,
-        'reservation_id': reservation_id,
-    }
-```
-
-### 6.6 Master App Entry Point
-
-```python
-# eab_master/app.py
-
-import uvicorn
-from oslo_config import cfg
-from oslo_log import log
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
-from eab_master.api import v1 as api_v1
-from eab_master import config as master_config
-from eab_master.db import models
-
-LOG = log.getLogger(__name__)
-
-
-def main():
-    master_config.register_opts(cfg.CONF)
-    cfg.CONF(project='eab-master')
-    log.setup(cfg.CONF, 'eab-master')
-
-    engine = create_engine(cfg.CONF.database.connection)
-    # Bootstrap convenience only — production deployments should manage the
-    # schema via the Alembic migrations in eab_master/db/migration/.
-    models.Base.metadata.create_all(engine)
-    session_factory = sessionmaker(bind=engine)
-
-    app = api_v1.create_app(session_factory)
-
-    LOG.info(
-        'EAB Master starting on %s:%s',
-        cfg.CONF.master.bind_host,
-        cfg.CONF.master.bind_port,
-    )
-
-    uvicorn.run(
-        app,
-        host=cfg.CONF.master.bind_host,
-        port=cfg.CONF.master.bind_port,
-    )
-```
-
-## 7. Sequence Diagrams
-
-### 7.1 Create Floating IP (automatic IP)
-
-```
-User                Neutron              IPAM Driver          EAB Agent         EAB Master
- |                    |                     |                    |                  |
- | create_floatingip  |                     |                    |                  |
- |------------------->|                     |                    |                  |
- |                    | create_port         |                    |                  |
- |                    | (FLOATINGIP owner)  |                    |                  |
- |                    |-------------------->|                    |                  |
- |                    |                     |                    |                  |
- |                    |          get_request(port, ip_dict)      |                  |
- |                    |                     |                    |                  |
- |                    |                     | device_owner ==    |                  |
- |                    |                     | FLOATINGIP?        |                  |
- |                    |                     | YES                |                  |
- |                    |                     |                    |                  |
- |                    |                     | POST /v1/addresses/|reserve           |
- |                    |                     |------------------->|                  |
- |                    |                     |                    | POST /v1/        |
- |                    |                     |                    | addresses/reserve|
- |                    |                     |                    |----------------->|
- |                    |                     |                    |                  |
- |                    |                     |                    |    Atomic:       |
- |                    |                     |                    |    find free IP, |
- |                    |                     |                    |    INSERT        |
- |                    |                     |                    |    allocation    |
- |                    |                     |                    |                  |
- |                    |                     |                    | 200 {ip, subnet} |
- |                    |                     |                    |<-----------------|
- |                    |                     | 200 {ip, subnet}   |                  |
- |                    |                     |<-------------------|                  |
- |                    |                     |                    |                  |
- |                    |  SpecificAddressRequest(ip)              |                  |
- |                    |<--------------------|                    |                  |
- |                    |                     |                    |                  |
- |                    | allocate(request)   |                    |                  |
- |                    | (NeutronDB local)   |                    |                  |
- |                    |                     |                    |                  |
- | 201 floatingip     |                     |                    |                  |
- |<-------------------|                     |                    |                  |
-```
-
-### 7.2 Delete Floating IP
-
-```
-User                Neutron              Callback             EAB Agent         EAB Master
- |                    |                     |                    |                  |
- | delete_floatingip  |                     |                    |                  |
- |------------------->|                     |                    |                  |
- |                    | delete FIP + port   |                    |                  |
- |                    | (local in DB)       |                    |                  |
- |                    |                     |                    |                  |
- |                    | AFTER_DELETE event  |                    |                  |
- |                    |-------------------->|                    |                  |
- |                    |                     | POST /v1/addresses/|release           |
- |                    |                     |------------------->|                  |
- |                    |                     |                    | POST /v1/        |
- |                    |                     |                    | addresses/release|
- |                    |                     |                    |----------------->|
- |                    |                     |                    |                  |
- |                    |                     |                    |  DELETE alloc    |
- |                    |                     |                    |                  |
- |                    |                     |                    | 200              |
- |                    |                     |                    |<-----------------|
- |                    |                     | 200                |                  |
- |                    |                     |<-------------------|                  |
- | 204                |                     |                    |                  |
- |<-------------------|                     |                    |                  |
-```
-
-### 7.3 Periodic Sync (Agent -> Master)
-
-```
-EAB Agent                                EAB Master
- |                                          |
- |  GET /v1/addresses?cloudpod_id=a         |
- |----------------------------------------->|
- |                                          |
- |  200 {allocations: [...]}                |
- |<-----------------------------------------|
- |                                          |
- |  Update cache                            |
- |  (full_sync)                             |
- |                                          |
- |  Compare: local Neutron FIPs vs          |
- |  master allocations                      |
- |                                          |
- |  If discrepancy:                         |
- |  - IP in Neutron but not in master       |
- |    -> log warning (manual intervention)  |
- |  - IP in master but not in Neutron       |
- |    -> send release to master             |
- |                                          |
-```
-
-To avoid racing an in-flight floating IP creation (already reserved at the
-master, but the Neutron transaction not yet committed), the agent only
-releases allocations that are absent from Neutron if they are older than a
-grace period (e.g. `2 * full_sync_interval`, based on `allocated_at`).
-
-The comparison against "local Neutron FIPs" requires the agent to read the
-local Neutron state; it uses the read-only Keystone credentials from the
-`[neutron]` config section (see Section 5.2).
-
-## 8. Error Scenarios and Handling
-
-### 8.1 Master Unreachable During Reserve
-
-```
-Behavior depends on configuration:
-
-fallback_to_local = false (default, recommended):
-    -> AgentUnavailableError
-    -> Neutron returns 503 to the user
-    -> No duplicate allocation possible
-    -> User must retry later
-
-fallback_to_local = true (emergency only):
-    -> IPAM driver falls back to AnyAddressRequest
-    -> Local allocation without master check
-    -> WARNING: Duplicate allocations possible!
-    -> Discrepancy detected during next sync
-```
-
-### 8.2 Agent Unreachable
-
-```
-IPAM driver cannot reach the local agent:
-    -> Same behavior as "master unreachable"
-    -> The agent runs locally, so this should almost never happen
-    -> systemd/supervisor ensures it is running
-```
-
-### 8.3 Race Condition: Two CloudPods Reserve Simultaneously
-
-```
-CloudPod A                   EAB Master                    CloudPod B
-    |                            |                              |
-    | reserve(auto)              |                reserve(auto) |
-    |--------------------------->|<-----------------------------|
-    |                            |                              |
-    |                      +-----+------+                       |
-    |                      | Serialized |                       |
-    |                      | via DB     |                       |
-    |                      | UNIQUE     |                       |
-    |                      | constraint |                       |
-    |                      +-----+------+                       |
-    |                            |                              |
-    | 200 {ip: .42}              |              200 {ip: .43}   |
-    |<---------------------------|----------------------------->|
-
-Atomicity is guaranteed by the UNIQUE constraint
-(ip_address, managed_subnet_id) in the master DB.
-For automatic allocation: _find_free_ip() + INSERT within a
-single DB transaction. On IntegrityError: retry with next free IP.
-```
-
-### 8.4 Orphaned Allocations
-
-```
-Scenario: Neutron deletes a FIP, but the AFTER_DELETE callback
-          cannot reach the agent/master.
-
-Solution: Periodic sync in the agent:
-    1. Agent fetches all its own allocations from master
-    2. Agent checks against local Neutron DB (FIPs)
-    3. Allocations that exist in master but not in Neutron
-       -> send release to master
-
-Additionally: Master-side orphan check:
-    - Configurable via cleanup.orphan_check_interval
-    - Master can ask agents about the status of an allocation
-```
-
-### 8.5 CloudPod Goes Offline
-
-```
-Scenario: A CloudPod fails completely.
-
-Behavior:
-    - Heartbeat stops
-    - Master marks CloudPod as offline after cloudpod_offline_timeout
-    - Allocations of the CloudPod remain in place (IPs stay reserved)
-    - IPs are NOT automatically released
-      (the CloudPod might still be announcing BGP routes)
-    - Manual release via admin API once it is confirmed
-      that the CloudPod is no longer using the IPs
-```
-
-### 8.6 Non-FIP Ports on the External Network (Router Gateways)
-
-```
-The IPAM driver only routes FLOATING IP allocations through the broker.
-Other ports on the external network — most importantly router gateway
-ports (device_owner = network:router_gateway), but also DHCP or service
-ports — are allocated by the local NeutronDbPool. Since all CloudPods use
-identical subnets, two CloudPods can assign the same gateway IP without
-the broker noticing — with the same conflict consequences as duplicate
-floating IPs.
-
-Recommended operating model:
-
-    1. Give the external subnet in each CloudPod a small, per-pod DISJOINT
-       allocation pool (e.g. pod A: .2-.9, pod B: .10-.17, ...). Automatic
-       local allocations (router gateways etc.) then come from a range
-       that is unique to the pod by construction.
-    2. Configure the broker-managed pool (pool_start/pool_end in the
-       ManagedSubnet) so that it does NOT overlap any of the local
-       allocation pools. Floating IPs are requested as specific addresses
-       and may therefore lie outside the local allocation pools.
-
-Alternative (Phase 3): route ALL allocations on managed external networks
-through the broker, not only floating IPs.
-```
-
-## 9. Setting Up a New Environment
-
-Step-by-step guide for adding a new CloudPod.
-
-### 9.1 Prerequisites
-
-- EAB master is running and reachable
-- New CloudPod has an external network with the same CIDRs
-
-### 9.2 On the Master
-
-```bash
-# 1. Register CloudPod
-curl -X POST https://eab-master:9533/v1/admin/cloudpods \
-    -H "Authorization: Bearer $ADMIN_TOKEN" \
-    -d '{
-        "id": "cloudpod-c",
-        "name": "CloudPod Berlin 1"
-    }'
-
-# 2. Create managed subnet (if not already present)
-curl -X POST https://eab-master:9533/v1/admin/subnets \
-    -H "Authorization: Bearer $ADMIN_TOKEN" \
-    -d '{
-        "cidr": "198.51.100.0/24",
-        "name": "Public IPv4",
-        "gateway_ip": "198.51.100.1",
-        "pool_start": "198.51.100.10",
-        "pool_end": "198.51.100.254"
-    }'
-
-# 3. Create network mapping
-#    (Map Neutron UUIDs of the new CloudPod to the ManagedSubnet)
-curl -X POST https://eab-master:9533/v1/admin/mappings \
-    -H "Authorization: Bearer $ADMIN_TOKEN" \
-    -d '{
-        "cloudpod_id": "cloudpod-c",
-        "neutron_network_id": "uuid-of-external-net-in-cloudpod-c",
-        "neutron_subnet_id": "uuid-of-subnet-in-cloudpod-c",
-        "managed_subnet_id": 1
-    }'
-```
-
-### 9.3 On the New CloudPod
-
-```bash
-# 1. Install plugin
-pip install networking-external-address-broker
-
-# 2. Configure neutron.conf
-cat >> /etc/neutron/neutron.conf <<EOF
-
-[DEFAULT]
-ipam_driver = external_address_broker
-
-[external_address_broker]
-agent_endpoint = http://localhost:9532
-agent_timeout = 5
-fallback_to_local = false
-EOF
-
-# 3. Configure EAB agent
-cat > /etc/eab/eab-agent.conf <<EOF
-[agent]
-cloudpod_id = cloudpod-c
-cloudpod_name = CloudPod Berlin 1
-bind_host = 127.0.0.1
-bind_port = 9532
-
-[master]
-endpoint = https://eab-master.example.com:9533
-auth_token = token-cloudpod-c
-timeout = 10
-
-[sync]
-full_sync_interval = 60
-heartbeat_interval = 10
-EOF
-
-# 4. Start agent
-systemctl enable --now eab-agent
-
-# 5. Restart Neutron server
-systemctl restart neutron-server
-```
-
-## 10. Monitoring and Operations
-
-### 10.1 Key Metrics
-
-| Metric | Source | Alert when |
-|--------|--------|------------|
-| Master reachable | Agent /v1/health | master_connected == false |
-| Agent reachable | Neutron logs | AgentUnavailableError |
-| Sync age | Agent /v1/health | last_sync > 5 minutes |
-| Free IPs | Master DB | < 10% of pool free |
-| CloudPod offline | Master DB | is_online == false |
-| Allocation discrepancy | Agent sync log | Warning in log |
-
-### 10.2 Log Messages
-
-```
-# Normal operation
-EAB: IP 198.51.100.42 reserved for network <uuid>
-EAB: Releasing IP 198.51.100.42 on network <uuid>
-Full sync completed, 42 entries
-
-# Warnings
-EAB agent unreachable, falling back to local allocation
-Master unreachable during release of 198.51.100.42
-Heartbeat to master failed
-
-# Errors
-EAB agent unreachable: http://localhost:9532
-Address must be released manually
-```
-
-### 10.3 Admin Commands
-
-```bash
-# List all allocations
-curl https://eab-master:9533/v1/addresses \
-    -H "Authorization: Bearer $TOKEN"
-
-# Allocations for a specific CloudPod
-curl "https://eab-master:9533/v1/addresses?cloudpod_id=cloudpod-a" \
-    -H "Authorization: Bearer $TOKEN"
-
-# All CloudPods and their status
-curl https://eab-master:9533/v1/cloudpods \
-    -H "Authorization: Bearer $TOKEN"
-
-# Managed subnets
-curl https://eab-master:9533/v1/admin/subnets \
-    -H "Authorization: Bearer $TOKEN"
-
-# Network mappings
-curl https://eab-master:9533/v1/admin/mappings \
-    -H "Authorization: Bearer $TOKEN"
-
-# Manual IP release (e.g. after CloudPod failure).
-# Release authorization is derived from the token (each token is bound to
-# one CloudPod), so this uses the failed pod's agent token. A dedicated
-# admin force-release endpoint is planned (see Section 12.2).
-curl -X POST https://eab-master:9533/v1/addresses/release \
-    -H "Authorization: Bearer $TOKEN_CLOUDPOD_A" \
-    -d '{"ip_address": "198.51.100.42", "network_id": "n/a"}'
-```
-
-## 11. Security
-
-### 11.1 Communication
-
-- Agent <-> Master: TLS (HTTPS) with token authentication
-- Neutron <-> Agent: Local (localhost), no TLS needed
-- Master API: Only reachable by agents and admins (firewall/network)
-
-### 11.2 Authentication
-
-- Initial implementation: Shared secrets (bearer token per CloudPod)
-- Extension: Keystone service tokens or mTLS between agent and master
-
-### 11.3 Authorization
-
-- Agents can only reserve/release addresses for their own CloudPod:
-  each token is bound to exactly one CloudPod ID, and the master derives
-  the acting CloudPod from the token — never from client-supplied headers
-  or body fields
-- Admin endpoints (/v1/admin/*) require a separate admin token
-  (`[auth] admin_token`)
-
-## 12. Open Items and Extensions
-
-### 12.1 Phase 1 (MVP)
-
-- [x] IPAM driver with AddressRequestFactory
-- [x] Agent with reserve/release API
-- [x] Master with atomic reservation
-- [x] Periodic sync
-- [x] Network mappings
-
-### 12.2 Phase 2
-
-- [ ] High availability: the master API is stateless — run two or more
-      replicas behind a load balancer on top of an HA PostgreSQL
-      (e.g. Patroni). Correctness is already guaranteed by the UNIQUE
-      constraint, not by having a single master process
-- [ ] Idempotent reserve: client-supplied idempotency key (e.g. the
-      Neutron port ID), so Neutron DB retries cannot create duplicate
-      allocations for the same request
-- [ ] Reservation leases: new allocations start as `pending` and expire
-      automatically unless confirmed (or observed via sync) — closes the
-      window in which failed Neutron transactions leak reservations
-- [ ] Release broker reservations from the IPAM deallocate path
-      (subclassed subnet driver) instead of relying only on the FIP
-      AFTER_DELETE callback plus sync (see Section 4.8)
-- [ ] Master background task that marks CloudPods offline after
-      cloudpod_offline_timeout (the config option exists, the task is
-      not yet specified) and computes is_online dynamically
-- [ ] Admin force-release endpoint (manual cleanup without agent tokens)
-- [ ] Rate limiting on the master
-- [ ] Audit log for all allocations/releases
-- [ ] CLI tool for admin operations (eab-manage)
-- [ ] Prometheus metrics endpoint on agent and master
-
-### 12.3 Phase 3
-
-- [ ] Keystone integration for authentication
-- [ ] Automatic subnet discovery (agent detects external networks
-      and registers mappings automatically at the master)
-- [ ] Web dashboard for allocation overview
-- [ ] Webhook notifications on allocation changes
-      (e.g. for BGP controller integration)
-- [ ] IPv6 support
-- [ ] Quota management per CloudPod or project
-- [ ] Broker *all* allocations on managed external networks (not only
-      floating IPs) — removes the per-pod pool partitioning described in
-      Section 8.6
-
-## 13. External NAT Realization (AWS-style)
-
-By default, once the EAB has allocated a floating IP, it is *realized* inside OVN: Neutron
-writes a single `dnat_and_snat` entry into the OVN northbound `NAT` table, and the
-[ovn-network-agent](#3-network-side-counterpart-ovn-network-agent) announces the corresponding
-/32 route via BGP (see Section 3).
-
-An alternative, more AWS-like model **decouples allocation from realization entirely**: the
-floating IP is still allocated via Neutron/EAB, but the 1:1 NAT is applied by a layer
-**outside of OpenStack/OVN**, and **no `dnat_and_snat` entry is created in OVN at all**. The
-public IP then exists only as a control-plane record (Neutron/EAB) and as a NAT rule at the
-network edge — exactly like an AWS Elastic IP, where the instance never sees its own public
-address.
-
-| Layer | Default (Section 3) | External NAT realization |
+| Open item | Where raised | Resolution |
 |---|---|---|
-| **Allocation** (who owns the IP) | Neutron IPAM → EAB | Neutron IPAM → EAB (unchanged) |
-| **Association** (FIP ↔ VM) | Neutron `floatingip` | Neutron `floatingip` (unchanged) |
-| **Realization / NAT** | OVN `dnat_and_snat`; agent announces **FIP** /32 | external NAT layer; agent announces **IRIP** /32; **not in OVN** |
+| Reservation leak windows (failed Neutron transactions) | R§4.8, R§12.2 | **D7** — leases + confirm protocol, promoted into the core |
+| Idempotent reserve | R§12.2 | **D7** — idempotency key |
+| IRIP attachment variant | X§5.1 | **D4** — Option C fixed as the default |
+| IRIP lifecycle granularity (per port vs. per FIP) | X§6.2 | **D8** — one IRIP per active FIP association |
+| NAT layer connection (push vs. BGP-driven) | X§6.3 | **D5** — push exporter + periodic reconcile |
+| Mixed pools vs. aggregate announcement | X§6.4 | **D6** — realization path is a pool property |
+| L3 flavor delegation feasibility | X§6.1, X§10 | **M0 spike S1** gates the external path only |
+| CloudPod offline-marking task | R§12.2 | scheduled in **M1** |
+| Admin force-release | R§10.3, R§12.2 | scheduled in **M1** |
+
+### 3.3 Missing entirely — added by this document
+
+- Brownfield adoption: importing pre-existing FIPs before enabling the driver (§9).
+- Test and verification strategy incl. multi-pod chaos tests (§10).
+- API contract freeze and versioning rules (§6).
+- Packaging and deployment reference (§8).
+- Explicit system invariants any implementation must maintain (§4.2).
+- Cross-pod FIP mobility named as the long-term target the design must not preclude (§12).
+
+## 4. Consolidated Target Architecture
+
+### 4.1 Big picture
 
 ```
-   Default:   Neutron/EAB ─► OVN dnat_and_snat ─► ovn-network-agent announces FIP /32
-   External:  Neutron/EAB ─► L3 flavor driver (no OVN NAT) ─► external NAT layer announces FIP /32
-                                                              (stateless 1:1 FIP↔IRIP)
-              └─ ovn-network-agent still runs, announcing the internal IRIP /32 instead
+ ┌───────────────────────────── Control plane ─────────────────────────────┐
+ │                                                                         │
+ │                        ┌────────────────────┐                           │
+ │                        │     EAB Master     │  allocations, mappings,   │
+ │                        │  (HA: N replicas   │  IRIP pool, NAT export    │
+ │                        │   + HA PostgreSQL) │                           │
+ │                        └───┬────────────┬───┘                           │
+ │            reserve/release │            │ /v1/nat/* + exporter          │
+ │            confirm/sync    │            │                               │
+ │   ┌────────────────────────┴──┐      ┌──┴──────────────────────────┐    │
+ │   │ per CloudPod (xN)         │      │ NAT controller (per region) │    │
+ │   │  EAB agent                │      │  consumes /v1/nat/mappings  │    │
+ │   │  Neutron:                 │      │  programs nftables + FRR    │    │
+ │   │   - EAB IPAM driver       │      └──────────────┬──────────────┘    │
+ │   │   - L3 flavor driver      │                     │                   │
+ │   │     "external-nat"        │                     │                   │
+ │   └──────────┬────────────────┘                     │                   │
+ └──────────────┼──────────────────────────────────────┼───────────────────┘
+                │                                      │
+ ┌─ Data plane ─┼──────────────────────────────────────┼───────────────────┐
+ │              ▼                                      ▼                   │
+ │  Path A (OVN-native, default)          Path B (external NAT)            │
+ │  ─────────────────────────────         ────────────────────────────     │
+ │  OVN dnat_and_snat (FIP↔fixed)         NAT nodes: stateless FIP↔IRIP    │
+ │  ovn-network-agent announces           NAT nodes announce FIP /32 or    │
+ │  FIP /32 → upstream                    aggregate → upstream             │
+ │                                        OVN dnat_and_snat (IRIP↔fixed)   │
+ │                                        ovn-network-agent announces      │
+ │                                        IRIP /32 → DC fabric             │
+ └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-The realization is suppressed in OVN via a custom **L3 flavor / service-provider driver**
-(`external-nat`) that overrides only the floating-IP operations and exports the mapping to an
-external, stateless 1:1 NAT layer (e.g. nftables+FRR, VPP, or a DPU). OVN keeps doing plain
-internal routing of a unique *internal routable IP* (IRIP); the public FIP never appears in
-the overlay.
+Both paths share the entire allocation machinery; they differ only in realization and
+announcement. Path selection is per router (L3 flavor, D3) and per pool (D6).
 
-**This is an alternative, not a replacement.** The default OVN-native path (Section 3) and the
-EAB allocation core remain in place, and the `ovn-network-agent` is still required — under
-external NAT it announces the internal **IRIP** /32 instead of the public **FIP** /32 (see
-[Section 3.4](#34-two-realization-paths-one-agent)). The two paths coexist and are chosen per
-router via the L3 flavor.
+### 4.2 System invariants
 
-For the full design — the L3 flavor driver, the EAB master data-model and `/v1/nat/*` API
-extensions, the IRIP pool, the external NAT layer, end-to-end packet flows, and a phased
-implementation plan — see **[EXTERNAL-NAT-REALIZATION.md](EXTERNAL-NAT-REALIZATION.md)**
-(design / draft).
+Every milestone's acceptance tests assert these; any implementation change must preserve them.
+
+- **I1 — Unique allocation.** An address from a managed pool is allocated to at most one
+  CloudPod at any time. Enforced by `UNIQUE(ip_address, managed_subnet_id)` in the master DB
+  (R§6.3) — never by convention.
+- **I2 — Single realization point.** At any time, at most one realization (an OVN NAT entry
+  *or* a NAT-layer rule set) is active per FIP, and announcements never steer one IP toward
+  two owners. Guaranteed structurally by D3 + D6.
+- **I3 — Fail closed.** No component allocates a managed address without the master's
+  confirmation. `fallback_to_local = true` is a documented emergency override, off by default
+  (R§8.1).
+- **I4 — Master is authoritative.** Agent caches and NAT-layer rule sets are derived state
+  and reconcile toward the master (R§7.3, X§6.3). Repair always flows master → edge.
+- **I5 — Control plane failures never touch realized traffic.** Master or agent outages block
+  *new* allocations/bindings only; existing NAT entries, rules, and BGP announcements stay up.
+
+## 5. Design Decisions
+
+Each decision: **what**, *why*, and consequences. These are binding for the implementation;
+revisiting one requires updating this section.
+
+### D1 — Fail-closed allocation
+Allocation consistency is prioritized over allocation availability. Master unreachable ⇒ FIP
+create returns 503 (R§8.1). *Why:* a duplicate public IP is a routing incident affecting
+third parties; a delayed FIP creation is a retry. Consequence: master availability is an
+operational SLO (mitigated by D2), and monitoring of `master_connected` is mandatory (R§10.1).
+
+### D2 — One allocation authority, HA through the database
+The master API is stateless; run ≥2 replicas behind a load balancer on HA PostgreSQL
+(Patroni). Correctness comes from the DB unique constraint, not from process singularity
+(R§12.2). *Why:* avoids consensus protocols in application code. Consequence: the DB is the
+real availability anchor; DB failover procedures are part of the runbook.
+
+### D3 — Realization is pluggable per router via L3 flavors
+Path A (OVN-native) is the default; Path B (`external-nat` flavor) is opt-in per router
+(X§6.1, R§3.4). Both are first-class and coexist indefinitely. *Why:* incremental adoption,
+no big-bang migration, per-workload choice. Consequence: the flavor-framework caveat (the OVN
+plugin skips flavored routers entirely) makes **spike S1 (§11, M0) the gate for Path B** —
+Path A and the allocation core do not depend on it.
+
+### D4 — IRIP attachment via Option C (OVN translates IRIP ↔ fixed IP)
+The `external-nat` L3 driver writes a `dnat_and_snat` row with `external_ip = IRIP` instead
+of the public FIP (X§5.1, Option C). *Why:* guest untouched, tenant CIDRs may overlap, port
+security satisfied, `ovn-network-agent` reuses its NAT-entry-driven logic with only the
+announcement target changed. The document goal holds: the *public* FIP never appears in OVN.
+Consequence: OVN is not NAT-free on Path B — accepted trade-off; Options A/B remain documented
+alternatives (X§5.1) but are not implemented.
+
+### D5 — NAT layer driven by push + reconcile, master authoritative
+The master (exporter) pushes mapping changes to the NAT controller; the controller
+additionally performs a periodic full reconcile against `GET /v1/nat/mappings` (X§6.3).
+*Why:* push gives low latency, reconcile gives convergence after any missed event.
+Consequence: the NAT controller must be idempotent and treat the mapping list as desired
+state (§6.3).
+
+### D6 — Realization path is a property of the managed pool
+Each public `ManagedSubnet` carries `realization ∈ {ovn, external-nat}` (§7). FIPs from an
+`external-nat` pool are only usable on `external-nat` routers and vice versa; the master
+rejects `/v1/nat/bind` for FIPs from `ovn` pools. *Why:* this is what makes aggregate-prefix
+announcement from the NAT nodes safe (X§6.4) and enforces I2 structurally instead of
+operationally. Consequence: operators provision (at least) two public pools when using both
+paths; documented in §9.
+
+### D7 — Reservation lifecycle: leases, confirm, idempotency (promoted into the core)
+R§12.2 listed leases and idempotent reserve as future work; they are **required** for
+correctness (the leak window in R§4.8 is otherwise only mitigated by the sync grace
+heuristic). Fixed protocol:
+
+1. `reserve` creates the allocation with `state = pending` and
+   `lease_expires_at = now + lease_ttl` (default 300 s). If the caller supplies an
+   `idempotency_key` (the FIP port ID when available at `get_request` time — verify during
+   M2), a repeated reserve with the same key returns the existing reservation instead of a
+   new one.
+2. **Confirm** turns `pending` into `active` (clears the lease). Two independent triggers:
+   a new `AFTER_CREATE` floating-IP callback in the plugin (post-commit, analogous to the
+   existing `AFTER_DELETE` callback, R§4.7) calls `POST /v1/addresses/confirm`; and the
+   agent's sync loop confirms any pending reservation it observes as an existing FIP in
+   local Neutron.
+3. A master-side **reaper** (runs with `cleanup.orphan_check_interval`) releases `pending`
+   allocations whose lease expired — this deterministically closes the failed-transaction
+   leak window.
+4. The agent-side release-on-absence rule (R§7.3) now applies to `active` allocations only;
+   `pending` ones belong to the reaper. The grace period stays as defense in depth.
+
+State machine: `PENDING ──confirm──▶ ACTIVE ──release──▶ (gone)`;
+`PENDING ──lease expiry──▶ (gone)`.
+
+### D8 — One IRIP per active FIP association
+An IRIP is allocated at `nat/bind` time and bound to the mapping record (FIP ↔ port), not to
+the port's lifetime (X§6.2 left this open). On unbind, the IRIP returns to the pool. On FIP
+re-association, the new bind allocates a fresh IRIP; the exporter replaces the FIP's rule set
+atomically (single nft transaction on the NAT node), then the old IRIP is released. *Why:*
+simplest lifecycle with no orphan tracking; the IRIP is invisible externally, so churn is
+harmless. Consequence: IRIP pool sizing = max concurrently *bound* FIPs (+ headroom).
+
+### D9 — Announcement responsibilities
+Path A: `ovn-network-agent` announces the FIP /32 toward upstream (R§3). Path B: NAT nodes
+announce the FIP — the **aggregate pool prefix** where a pool is exclusively `external-nat`
+(guaranteed by D6), otherwise per-/32 — and the `ovn-network-agent` announces the IRIP /32
+into the DC fabric (X§6.4–6.6). No component ever announces an address it does not realize.
+
+### D10 — Brownfield pods must import before enabling
+Enabling the IPAM driver on a pod with pre-existing FIPs without importing them into the
+master would let the master hand out already-used addresses to other pods. The import
+procedure (§9) is therefore a **mandatory** step in the enablement runbook, and `eab-manage
+import` is a deliverable (M3).
+
+## 6. Interface Contracts
+
+### 6.1 API surface and versioning
+
+All master and agent endpoints live under `/v1`. Within `v1`, changes are **additive only**
+(new endpoints, new optional fields); breaking changes require `/v2`. The FastAPI apps
+generate OpenAPI documents; CI publishes them as artifacts, and the contract tests (§10) run
+the real clients against a live master.
+
+Consolidated endpoint inventory (existing = R§5.3/R§6.5, X = X§6.2, new = this document):
+
+| Endpoint | Source | Milestone |
+|---|---|---|
+| `POST /v1/addresses/reserve` | R§6.5 | M1 |
+| `POST /v1/addresses/release` | R§6.5 | M1 |
+| `POST /v1/addresses/confirm` | **new (D7)** | M1 |
+| `GET /v1/addresses` | R§6.5 | M1 |
+| `POST /v1/cloudpods/heartbeat`, `GET /v1/cloudpods` | R§6.5 | M1 |
+| `POST /v1/admin/{subnets,cloudpods,mappings}` + `GET` variants | R§6.5 | M1 |
+| `POST /v1/admin/addresses/force-release` | **new (R§12.2 item)** | M1 |
+| `GET /v1/health` (master and agent) | R§5.3/R§6.5 | M1/M2 |
+| Agent: `POST /v1/addresses/{reserve,release}` | R§5.3 | M2 |
+| Agent: `POST /v1/nat/{bind,unbind}` (local, from L3 driver) | X§6.3 | M4 |
+| `POST /v1/nat/bind`, `POST /v1/nat/unbind`, `GET /v1/nat/mappings` | X§6.2 | M4 |
+
+Error model (uniform): `400` invalid input (e.g. IP outside managed pool), `401`
+unauthenticated, `403` token/CloudPod mismatch, `404` unknown mapping/allocation, `409`
+conflict (already allocated / pool exhausted), `503` upstream authority unreachable.
+
+### 6.2 Reserve/confirm additions (D7)
+
+`reserve` request gains an optional `idempotency_key` (string, unique per reservation);
+response is unchanged. New endpoint:
+
+```
+POST /v1/addresses/confirm
+{ "ip_address": "198.51.100.42", "network_id": "<neutron-net-uuid>" }
+→ 200 { "ip_address": ..., "state": "active" }   (idempotent; 404 if unknown)
+```
+
+The acting CloudPod is derived from the token, as everywhere (R§11.3).
+
+### 6.3 Exporter → NAT controller contract (D5)
+
+The exporter delivers **desired state**, not events:
+
+- Incremental push on every bind/unbind: the full record
+  `{fip, irip, state, version}` for the affected FIP.
+- Periodic full document: the complete active mapping list (equivalent to
+  `GET /v1/nat/mappings`).
+
+The NAT controller must be idempotent: applying the same record twice is a no-op; applying a
+record replaces the FIP's rules in one atomic nft transaction (D8); a FIP absent from a full
+document gets its rules removed. The controller reports rule application back (ack), which
+transitions `nat_state: pending → active` (X§6.2).
+
+## 7. Consolidated Data Model
+
+Base: R§6.3 (`CloudPod`, `ManagedSubnet`, `NetworkMapping`, `Allocation`) plus X§6.2
+extensions, refined as follows:
+
+```
+ManagedSubnet            (R§6.3, extended)
+  + kind          : 'public' | 'internal'        # 'internal' = IRIP pool (replaces the
+                                                 #  config-only irip_pool_cidr from X§9)
+  + realization   : 'ovn' | 'external-nat'       # public pools only; enforces D6
+
+Allocation               (R§6.3 + X§6.2, extended)
+  + state             : 'pending' | 'active'     # D7
+  + lease_expires_at  : datetime, nullable       # D7 (set while pending)
+  + idempotency_key   : string, nullable, unique # D7
+  + target_ip / target_port / nat_state / nat_node   # X§6.2 (Path B only)
+
+InternalAddress          (X§6.2, refined)
+  - pool_cidr (string)  → replaced by managed_subnet_id FK to a ManagedSubnet
+                          with kind='internal'   # unifies pool logic with _find_free_ip
+```
+
+Rationale for the `kind` unification: IRIP allocation then reuses the exact allocation
+machinery (pool iteration, unique constraint, race retry, R§8.3) instead of a parallel
+implementation.
+
+Schema management: Alembic migrations from the first migration onward;
+`Base.metadata.create_all` remains a dev-only bootstrap (as already noted in R§6.6).
+
+## 8. Packaging and Deployment Reference
+
+- **One Python distribution** with extras, as specified in R§4.2: the IPAM/L3 drivers stay
+  lightweight (imported into neutron-server); `[agent]` / `[master]` pull service deps.
+- **Artifacts:** pip package; container images `eab-master`, `eab-agent`,
+  `eab-nat-controller`; systemd units + sample configs under `etc/` (R§4.1).
+- **Reference topology:** master ≥2 replicas behind a LB on HA PostgreSQL (D2); one agent per
+  controller node bound to localhost (R§5); ≥2 NAT nodes with ECMP/anycast and identical rule
+  sets (X§6.4).
+- **Ecosystem integration:** OSISM/kolla deployment roles are an optional M5 deliverable; the
+  design must not depend on any specific deployment tool.
+
+## 9. Brownfield Adoption and Pod Lifecycle
+
+### 9.1 Enabling EAB on a pod with existing FIPs (D10)
+
+1. Register the pod, managed subnets, and network mappings at the master (R§9.2).
+2. Enter a FIP-change freeze (maintenance window) for the pod.
+3. Run `eab-manage import --cloudpod <id>`: lists all FIPs on managed external networks from
+   local Neutron and registers each via `reserve` with the specific IP, created directly as
+   `state=active`. **Conflicts (already allocated to another pod) are the duplicates the
+   whole system exists to find** — the tool reports them; the operator resolves manually
+   before proceeding.
+4. Enable `ipam_driver = external_address_broker`, start the agent, restart neutron-server
+   (R§9.3).
+5. Verify: local FIP count equals the master's allocation count for this pod; the first sync
+   reports no discrepancies; lift the freeze.
+
+### 9.2 Provisioning pools for both paths (D6)
+
+Operators using Path B create separate public managed subnets per realization path (e.g.
+`198.51.100.0/24` → `ovn`, `203.0.113.0/24` → `external-nat`) plus at least one internal pool
+(`kind=internal`) for IRIPs, sized per D8. Each pod maps its corresponding Neutron networks
+onto them (R§9.2). The per-pod disjoint allocation pools for router gateways (R§8.6) remain
+required until "broker all allocations" lands (M5).
+
+### 9.3 Decommissioning a pod
+
+Extends R§8.5: mark the pod offline, confirm BGP withdrawal of all its /32s (and that no
+`external-nat` mappings still target IRIPs in that pod), then force-release its allocations
+via the admin endpoint (M1) — never automatically.
+
+## 10. Test and Verification Strategy
+
+| Level | Setup | What it proves |
+|---|---|---|
+| **Unit** (tox, every PR) | none | Factory routing logic (device_owner / external-network checks, R§4.6); allocation race retry; lease reaper; IRIP allocator; exporter idempotency. |
+| **Contract** (every PR) | master + Postgres in containers | Real `AgentClient`/`MasterClient` against a live master; OpenAPI conformance; error-model table (§6.1). |
+| **Functional race storm** (every PR) | master + Postgres + 2 simulated agents (docker-compose) | **I1**: N parallel reserves from 2 pods ⇒ zero duplicates; pool exhausts at exactly pool-size allocations; lease expiry releases unconfirmed reservations. |
+| **Single-pod integration** (gate) | one devstack/kolla-AIO with driver enabled | FIP CRUD via broker; specific-IP requests; induced port-create failure (quota) ⇒ reservation auto-released within lease TTL; agent down ⇒ FIP create fails 503 (**I3**). |
+| **Multi-pod e2e** (periodic) | 2 AIO pods + 1 master | Concurrent FIP create/delete loops across pods ⇒ **I1** holds; kill master mid-storm ⇒ both pods fail closed, existing FIPs keep passing traffic (**I5**), no duplicates after recovery; brownfield import scenario (§9.1) incl. seeded duplicate detection. |
+| **Path B data path** (lab, then periodic) | X§8 Phase 0 lab: NAT nodes + FRR + one pod | `ovn-nbctl lr-nat-list` shows no public FIP for `external-nat` routers; inbound/outbound flows per X§7; ECMP asymmetry (two NAT nodes, directions forced onto different nodes — must work statelessly); drift injection (delete an nft rule ⇒ reconcile restores it within `reconcile_interval`); NAT node failure ⇒ flows unaffected. |
+| **Failure drills** | staging | Walk R§8.1–8.6 as an operator checklist per release. |
+
+## 11. Implementation Roadmap
+
+Milestones are strictly ordered by dependency, except S1/S2 which run in parallel to M1–M3.
+The allocation core (M1–M3) delivers standalone value — conflict-free distributed floating
+IPs with today's OVN realization — even if Path B were never built.
+
+### M0 — Bootstrap and feasibility spikes
+- Repo skeleton per R§4.1; tox, lint, unit-test CI; Alembic scaffolding.
+- **Spike S1 (gates M4 only):** minimal L3 flavor passthrough driver on the target release
+  (2024.x/2025.x): verify router/interface/gateway operations can be re-delegated to the OVN
+  backend while FIP operations are intercepted (X§6.1 caveat). Exit: written go/no-go with
+  the concrete delegation mechanism, or a fallback plan (e.g. carrying a small Neutron patch
+  upstream).
+- **Spike S2 (optional, parallel):** X§8 Phase 0 — NAT data path standalone (nftables + FRR,
+  manual mapping), proving stateless 1:1 + ECMP before any OpenStack coupling.
+
+*Acceptance:* CI green on the empty skeleton; S1 report merged.
+
+### M1 — EAB master
+- Data model §7 (incl. D7 columns, `kind`/`realization`); Alembic migration 001.
+- API per §6.1 (M1 rows): reserve (with idempotency), release, **confirm**, list, heartbeat,
+  admin CRUD, **admin force-release**.
+- Background tasks: lease reaper (D7), CloudPod offline marking
+  (`cloudpod_offline_timeout`, R§12.2).
+- Prometheus metrics endpoint; audit log of every reserve/confirm/release with acting pod.
+
+*Acceptance:* race-storm suite green (I1); reaper test green; OpenAPI artifact published.
+
+### M2 — Agent + IPAM driver (single pod, Path A complete)
+- Agent per R§5 (app, master client, cache, sync incl. pending-confirmation logic per D7).
+- IPAM driver + `AddressRequestFactory` per R§4; `AFTER_DELETE` callback (R§4.7) plus the new
+  `AFTER_CREATE` confirm callback (D7); callback import wiring per R§4.8.
+- Verify idempotency-key availability (FIP port ID at `get_request` time) — adjust D7 note.
+
+*Acceptance:* single-pod integration suite green (incl. fail-closed and leak-cleanup tests,
+§10); a FIP allocated via broker is realized in OVN and announced by `ovn-network-agent`
+exactly as before (Path A regression-free).
+
+### M3 — Multi-pod hardening and operations
+- Multi-pod e2e environment and chaos suite (§10).
+- `eab-manage` CLI: `import` (§9.1), `force-release`, `report` (allocation/discrepancy
+  overview).
+- Brownfield runbook (§9.1) validated against a pod with pre-existing FIPs.
+- Rate limiting on the master; dashboards for the R§10.1 metrics.
+
+*Acceptance:* multi-pod chaos suite green incl. master-outage scenario (I3/I5); import of a
+pod with seeded duplicates produces the expected conflict report.
+
+### M4 — External NAT path (Path B) — *gated by S1*
+- Master: NAT extensions (§7 Path B columns, `InternalAddress`, `/v1/nat/*`), IRIP allocator
+  reusing pool machinery, exporter + reconcile (D5, §6.3), D6 validation (`bind` rejected for
+  `ovn` pools).
+- Neutron: `external-nat` L3 flavor driver with delegation per S1; Option C NAT row
+  (`external_ip = IRIP`, D4); agent `bind_nat`/`unbind_nat` passthrough (X§6.3).
+- NAT controller: consumes desired state, programs nftables (notrack, raw priority — X§6.4)
+  + FRR; aggregate announcement for exclusive pools (D9).
+- `ovn-network-agent` (separate repo, coordinated release): IRIP /32 announcement into the
+  fabric, keyed off NAT rows whose `external_ip` is an IRIP (X§6.5–6.6).
+
+*Acceptance:* X§7 flows demonstrated end-to-end on the lab; Path B suite (§10) green incl.
+ECMP asymmetry, drift repair, and no-public-FIP-in-OVN check; FIP re-association swaps IRIP
+without traffic to other FIPs being touched (D8).
+
+### M5 — Scale-out and evolution
+- HA validation (master replicas + Patroni failover drill, D2).
+- IPv6: allocation is address-family-agnostic already; Path B realizes IPv6 routing-only (no
+  NAT, X§8 Phase 3).
+- Quota management per pod/project (R§12.3); webhook notifications (R§12.3).
+- "Broker all allocations on managed external networks" — removes the R§8.6 partitioning.
+- Optional: OSISM/kolla deployment integration; web dashboard.
+
+*Acceptance:* per item; defined when scheduled.
+
+### Traceability
+
+| Vision element (§1) | Decisions | Delivered by |
+|---|---|---|
+| Any IP in any pod, exactly once | D1, D2, D7 | M1–M3 |
+| Routing follows allocation | D9 | M2 (Path A), M4 (Path B) |
+| Realization per router | D3, D4, D6 | M4 (gated by S1) |
+| IP as pure control-plane object | D5, D8 | M4 |
+| Moves without renumbering | (§12, out of scope) | future |
+
+## 12. Future Evolution (explicitly out of scope, must not be precluded)
+
+- **Cross-pod FIP mobility:** re-associating a FIP to a workload in *another* pod without
+  renumbering. Path B makes this a mapping update (new IRIP in the target pod) plus a
+  Neutron-side ownership transfer — the natural payoff of the mapping-service model. Requires
+  a master-side "allocation transfer" operation; nothing in the current design blocks it.
+- **Overlapping tenant CIDRs without IRIPs:** per-tenant encapsulation / EVPN Type-5 at the
+  NAT layer (X§5, X§10).
+- **Keystone-based authentication** between agents and master (R§11.2, R§12.3).
+- **Hierarchical / multi-region brokers** if a single master domain becomes too large.
+
+## 13. Consolidated Risk Register
+
+| # | Risk | Impact | Mitigation | Tracked in |
+|---|---|---|---|---|
+| 1 | L3 flavor framework skips flavored routers entirely; delegation to OVN may not be cleanly possible on the target release | Path B blocked | Spike S1 before any M4 investment; fallback: upstream patch or postponing Path B (core unaffected) | M0 |
+| 2 | Master/DB outage blocks all FIP creation platform-wide | Ops incident | D2 (replicas + Patroni), monitoring R§10.1, I5 keeps data plane up | M1, M5 |
+| 3 | Reservation leaks from failed Neutron transactions | Pool erosion | D7 leases + reaper (deterministic), sync grace as backup | M1/M2 |
+| 4 | Brownfield enablement without import creates instant duplicates | Routing conflict | D10 mandatory runbook + `eab-manage import` conflict report | M3 |
+| 5 | Mixed pools break aggregate announcement | Blackholed FIPs | D6 pool property, master-side validation | M4 |
+| 6 | Outbound traffic of IRIP sources bypasses the NAT layer | Asymmetric/broken egress | Fabric policy routing + explicit test in Path B suite (X§10) | M4 |
+| 7 | Dual source of truth (Neutron / master / NAT layer) drifts | Stale rules | I4 + reconcile with drift-injection tests | M4 |
+| 8 | Stateless NAT ⇒ no shared N:1 SNAT for FIP-less VMs behind `external-nat` routers | Feature gap | Documented constraint (X§10); separate stateful egress service if needed | docs |
+| 9 | Security-group/conntrack asymmetry with stateless NAT + ECMP | Dropped flows | Explicit ECMP-asymmetry test; SGs enforced at the VM port on the IRIP side (X§10) | M4 |
+| 10 | Non-FIP ports (router gateways) collide across pods | Routing conflict | R§8.6 disjoint-pool operating rule until M5 "broker all allocations" | M3 docs, M5 |
